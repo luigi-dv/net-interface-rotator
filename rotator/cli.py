@@ -57,6 +57,33 @@ def cmd_restore(backend: Backend, args) -> None:
     log(f"{backend.interface} restored to {target}")
 
 
+def next_action(
+    prev_network: str | None,
+    network: str | None,
+    now: float,
+    last_rotation: float,
+    interval: float,
+    cooldown: float,
+) -> str | None:
+    """Decide whether the watcher should rotate on this poll.
+
+    Returns the reason to log, or None to leave the address alone. Pure: no
+    clock, no backend. `now` and `last_rotation` are monotonic seconds.
+    """
+    elapsed = now - last_rotation
+    # Our own rotation drops and rejoins the network; ignore that churn.
+    settling = elapsed < cooldown
+
+    if not settling and prev_network and not network:
+        # Rotate while disconnected so the next network sees a fresh address.
+        return "Disconnected"
+    if not settling and network and prev_network and network != prev_network:
+        return f"Network changed to {network}"
+    if interval and elapsed >= max(interval, cooldown):
+        return "Interval elapsed"
+    return None
+
+
 def cmd_watch(backend: Backend, args) -> None:
     require_root()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
@@ -76,17 +103,11 @@ def cmd_watch(backend: Backend, args) -> None:
         while True:
             time.sleep(args.poll)
             network = backend.network_id()
-            now = time.monotonic()
-            # Our own rotation drops and rejoins the network; ignore that churn.
-            settling = now - last_rotation < args.cooldown
-
-            if not settling and last_network and not network:
-                # Rotate while disconnected so the next network sees a fresh address.
-                last_rotation = do_rotate("Disconnected")
-            elif not settling and network and last_network and network != last_network:
-                last_rotation = do_rotate(f"Network changed to {network}")
-            elif args.interval and now - last_rotation >= max(args.interval, args.cooldown):
-                last_rotation = do_rotate("Interval elapsed")
+            reason = next_action(
+                last_network, network, time.monotonic(), last_rotation, args.interval, args.cooldown
+            )
+            if reason:
+                last_rotation = do_rotate(reason)
             if network != last_network:
                 log(f"Network: {network or 'not connected'}")
             last_network = network
