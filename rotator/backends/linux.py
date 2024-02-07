@@ -7,6 +7,9 @@ from .. import mac as macmod
 from .base import Backend, BackendError, run
 
 
+HOSTNAME_PATH = Path("/proc/sys/kernel/hostname")
+
+
 class LinuxBackend(Backend):
     def _sys(self, name: str) -> Path:
         return Path("/sys/class/net") / self.interface / name
@@ -48,3 +51,29 @@ class LinuxBackend(Backend):
         neigh = run("ip", "neigh", "show", gw.group(1), "dev", self.interface, check=False)
         gw_mac = re.search(r"lladdr\s+([0-9a-f:]+)", neigh)
         return f"{gw.group(1)}@{gw_mac.group(1) if gw_mac else '?'}"
+
+    def get_hostname(self) -> dict[str, str | None]:
+        return {"transient": HOSTNAME_PATH.read_text().strip()}
+
+    def set_hostname(self, names: dict[str, str | None]) -> None:
+        for key, value in names.items():
+            if value is None:
+                continue
+            if key != "transient":
+                raise ValueError(f"Unknown host name key: {key}")
+            run("hostnamectl", "set-hostname", "--transient", value)
+
+    # Inbound exposure: nothing to do here. On Linux, inbound blocking comes
+    # from the session's own nftables table (the Phase 2 kill switch), which is
+    # removed as a whole, so there is no host firewall setting to save.
+
+    def get_inbound(self) -> dict[str, bool]:
+        """No-op: inbound blocking on Linux is the Phase 2 nftables table."""
+        return {}
+
+    def harden_inbound(self) -> dict[str, bool]:
+        """No-op: inbound blocking on Linux is the Phase 2 nftables table."""
+        return {}
+
+    def restore_inbound(self, previous: dict[str, bool]) -> None:
+        """No-op: inbound blocking on Linux is the Phase 2 nftables table."""

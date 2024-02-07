@@ -37,3 +37,39 @@ class Backend(ABC):
     @abstractmethod
     def network_id(self) -> str | None:
         """A fingerprint of the connected network, or None when disconnected."""
+
+    @abstractmethod
+    def get_hostname(self) -> dict[str, str | None]:
+        """The machine's host names, keyed by backend-specific names.
+
+        A name the OS has not set is reported as None.
+        """
+
+    @abstractmethod
+    def set_hostname(self, names: dict[str, str | None]) -> None:
+        """Apply the host names in ``names``. Requires root.
+
+        Keys whose value is None are skipped: this never unsets a name.
+        """
+
+    @abstractmethod
+    def get_inbound(self) -> dict[str, bool]:
+        """The current inbound-exposure settings, as needed to restore them.
+
+        Backends with nothing to manage here return an empty dict.
+        """
+
+    @abstractmethod
+    def harden_inbound(self) -> dict[str, bool]:
+        """Block unsolicited inbound connections. Requires root.
+
+        Returns the settings as they were *before* hardening: the value a
+        session journals and later passes to ``restore_inbound``.
+        """
+
+    @abstractmethod
+    def restore_inbound(self, previous: dict[str, bool]) -> None:
+        """Set the inbound settings back to ``previous``. Requires root.
+
+        Keys missing from ``previous`` are left alone.
+        """

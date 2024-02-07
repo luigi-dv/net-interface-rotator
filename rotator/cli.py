@@ -23,10 +23,19 @@ def require_root() -> None:
         sys.exit("This command changes the interface and must be run with sudo.")
 
 
-def rotate(backend: Backend, new_mac: str | None = None) -> str:
+def rotate(backend: Backend, new_mac: str | None = None, journal=None) -> str:
+    """Apply a new MAC and return it.
+
+    ``journal`` is the ``rotator.journal`` module (or an object with the same
+    ``record``) when called from a session: the address in use is journaled,
+    and synced to disk, before it is replaced, so ``journal.rollback`` can put
+    it back. Standalone ``rotate`` passes nothing and relies on ``state`` alone.
+    """
     current = backend.current_mac()
     state.remember_original(backend.interface, current)
     target = macmod.normalize(new_mac) if new_mac else macmod.generate(exclude=current)
+    if journal is not None:
+        journal.record("mac", {"interface": backend.interface, "mac": current})
     backend.set_mac(target)
     return target
 

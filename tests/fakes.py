@@ -5,12 +5,24 @@ from rotator.backends.base import Backend
 
 class FakeBackend(Backend):
     def __init__(self, interface: str = "en0", mac: str = "aa:bb:cc:dd:ee:ff",
-                 hardware: str | None = None, network: str | None = None):
+                 hardware: str | None = None, network: str | None = None,
+                 hostnames: dict[str, str | None] | None = None,
+                 inbound: dict[str, bool] | None = None):
         super().__init__(interface)
         self.mac = mac
         self.hardware = hardware
         self.network = network
+        self.hostnames: dict[str, str | None] = (
+            dict(hostnames) if hostnames is not None
+            else {"ComputerName": "Real Mac", "LocalHostName": "Real-Mac", "HostName": None}
+        )
         self.set_calls: list[str] = []
+        self.hostname_calls: list[dict[str, str | None]] = []
+        self.inbound: dict[str, bool] = (
+            dict(inbound) if inbound is not None
+            else {"global": False, "blockall": False, "stealth": False}
+        )
+        self.inbound_calls: list[tuple] = []
 
     def current_mac(self) -> str:
         return self.mac
@@ -25,3 +37,25 @@ class FakeBackend(Backend):
 
     def network_id(self) -> str | None:
         return self.network
+
+    def get_hostname(self) -> dict[str, str | None]:
+        return dict(self.hostnames)
+
+    def set_hostname(self, names: dict[str, str | None]) -> None:
+        self.hostname_calls.append(dict(names))
+        for key, value in names.items():
+            if value is not None:
+                self.hostnames[key] = value
+
+    def get_inbound(self) -> dict[str, bool]:
+        return dict(self.inbound)
+
+    def harden_inbound(self) -> dict[str, bool]:
+        previous = dict(self.inbound)
+        self.inbound_calls.append(("harden",))
+        self.inbound = {key: True for key in self.inbound}
+        return previous
+
+    def restore_inbound(self, previous: dict[str, bool]) -> None:
+        self.inbound_calls.append(("restore", dict(previous)))
+        self.inbound.update(previous)
