@@ -1,0 +1,33 @@
+add table inet net_interface_rotator
+delete table inet net_interface_rotator
+table inet net_interface_rotator {
+	chain input {
+		type filter hook input priority -10; policy accept;
+		iifname "lo" accept
+		iifname "wlan0" meta nfproto ipv4 udp sport 67 udp dport 68 ct state established accept
+		iifname "wlan0" ip saddr 192.0.2.10 udp sport 51820 ct state established accept
+		iifname "wlan0" meta nfproto ipv4 tcp sport 80 ct state established accept
+		iifname "wlan0" meta nfproto ipv4 tcp sport 443 ct state established accept
+		iifname "wlan0" meta nfproto ipv4 udp sport 53 ct state established accept
+		iifname "wlan0" meta nfproto ipv4 tcp sport 53 ct state established accept
+		iifname "wlan0" drop
+	}
+
+	chain output {
+		type filter hook output priority -10; policy accept;
+		oifname "lo" accept
+		oifname "wlan0" meta nfproto ipv4 udp sport 68 udp dport 67 accept
+		oifname "wlan0" ip daddr 192.0.2.10 udp dport 51820 accept
+		oifname "wlan0" meta nfproto ipv4 tcp dport 80 accept
+		oifname "wlan0" meta nfproto ipv4 tcp dport 443 accept
+		oifname "wlan0" meta nfproto ipv4 udp dport 53 accept
+		oifname "wlan0" meta nfproto ipv4 tcp dport 53 accept
+		oifname "wlan0" drop
+	}
+
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+		iifname "wlan0" drop
+		oifname "wlan0" drop
+	}
+}

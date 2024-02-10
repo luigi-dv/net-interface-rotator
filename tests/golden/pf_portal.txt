@@ -1,0 +1,9 @@
+pass quick on lo0 all no state
+pass out quick on en0 inet proto udp from any port 68 to any port 67 keep state
+pass out quick on en0 inet proto udp from any to 192.0.2.10 port 51820 keep state
+pass out quick on en0 inet proto tcp from any to any port 80 flags S/SA keep state
+pass out quick on en0 inet proto tcp from any to any port 443 flags S/SA keep state
+pass out quick on en0 inet proto udp from any to any port 53 keep state
+pass out quick on en0 inet proto tcp from any to any port 53 flags S/SA keep state
+block drop quick on en0 inet6 all
+block drop quick on en0 all
