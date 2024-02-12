@@ -7,11 +7,21 @@ class FakeBackend(Backend):
     def __init__(self, interface: str = "en0", mac: str = "aa:bb:cc:dd:ee:ff",
                  hardware: str | None = None, network: str | None = None,
                  hostnames: dict[str, str | None] | None = None,
-                 inbound: dict[str, bool] | None = None):
+                 inbound: dict[str, bool] | None = None,
+                 gateway_ip: str | None = None,
+                 neigh: dict[str, set[str]] | None = None,
+                 dns: list[str] | None = None,
+                 wifi_ssid: str | None = None,
+                 wifi_bssid: str | None = None):
         super().__init__(interface)
         self.mac = mac
         self.hardware = hardware
         self.network = network
+        self.gateway_ip = gateway_ip
+        self.neigh: dict[str, set[str]] = {ip: set(macs) for ip, macs in (neigh or {}).items()}
+        self.dns: list[str] = list(dns or [])
+        self.wifi_ssid = wifi_ssid
+        self.wifi_bssid = wifi_bssid
         self.hostnames: dict[str, str | None] = (
             dict(hostnames) if hostnames is not None
             else {"ComputerName": "Real Mac", "LocalHostName": "Real-Mac", "HostName": None}
@@ -59,3 +69,18 @@ class FakeBackend(Backend):
     def restore_inbound(self, previous: dict[str, bool]) -> None:
         self.inbound_calls.append(("restore", dict(previous)))
         self.inbound.update(previous)
+
+    def gateway(self) -> str | None:
+        return self.gateway_ip
+
+    def neighbours(self) -> dict[str, set[str]]:
+        return {ip: set(macs) for ip, macs in self.neigh.items()}
+
+    def dhcp_dns(self) -> list[str]:
+        return list(self.dns)
+
+    def ssid(self) -> str | None:
+        return self.wifi_ssid
+
+    def bssid(self) -> str | None:
+        return self.wifi_bssid

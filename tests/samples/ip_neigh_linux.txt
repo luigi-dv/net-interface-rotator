@@ -1,0 +1,5 @@
+192.0.2.1 dev wlan0 lladdr 02:00:5e:10:00:01 REACHABLE
+192.0.2.50 dev wlan0 lladdr 96:d8:d5:00:00:50 STALE
+192.0.2.99 dev wlan0 FAILED
+fe80::1 dev wlan0 lladdr 02:00:5e:10:00:01 router STALE
+198.51.100.7 dev eth0 lladdr 00:1b:63:0a:0b:0c DELAY

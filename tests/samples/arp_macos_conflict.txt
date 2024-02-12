@@ -1,0 +1,3 @@
+? (192.0.2.1) at 02:00:5e:10:00:01 on en0 ifscope [ethernet]
+? (192.0.2.1) at 02:00:5e:66:66:66 on en0 ifscope [ethernet]
+? (192.0.2.50) at 96:d8:d5:00:00:50 on en0 ifscope [ethernet]

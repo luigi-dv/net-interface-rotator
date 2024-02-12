@@ -21,6 +21,9 @@ _ON_RE = re.compile(r"\b(?:enabled|on)\b", re.I)
 _OFF_RE = re.compile(r"\b(?:disabled|off)\b", re.I)
 # Older macOS reports an active block-all without the word "enabled".
 _BLOCKALL_ON_RE = re.compile(r"set to block all", re.I)
+_ROUTE_GATEWAY_RE = re.compile(r"gateway:\s*(\S+)")
+_DNS_RE = re.compile(r"domain_name_server \(ip_mult\):\s*\{([^}]*)\}")
+_MAC_TOKEN_RE = re.compile(r"^[0-9a-f]{1,2}(:[0-9a-f]{1,2}){5}$", re.I)
 
 
 def parse_firewall_flag(key: str, output: str) -> bool:
@@ -46,6 +49,42 @@ def parse_firewall_flag(key: str, output: str) -> bool:
             f"Cannot tell the firewall '{key}' setting from: {output.strip()!r}"
         )
     return verdicts.pop()
+
+
+def parse_route_gateway(output: str) -> str | None:
+    """The gateway IP from ``route -n get ... default`` output, or None."""
+    gw = _ROUTE_GATEWAY_RE.search(output)
+    return gw.group(1) if gw else None
+
+
+def parse_arp(output: str, interface: str) -> dict[str, set[str]]:
+    """IP -> MACs from ``arp -an`` output, for entries on ``interface`` only.
+
+    macOS prints octets without zero padding (``0:1b:63:a:b:c``), so each octet
+    is padded before normalizing. Incomplete entries are skipped.
+    """
+    result: dict[str, set[str]] = {}
+    for line in output.splitlines():
+        if f" on {interface} " not in line or "(incomplete)" in line:
+            continue
+        m = re.match(r"^\S+\s+\(([^)]+)\)\s+at\s+(\S+)", line)
+        if not m or not _MAC_TOKEN_RE.match(m.group(2)):
+            continue
+        octets = (o.zfill(2) for o in m.group(2).split(":"))
+        try:
+            mac = macmod.normalize(":".join(octets))
+        except ValueError:
+            continue
+        result.setdefault(m.group(1), set()).add(mac)
+    return result
+
+
+def parse_dhcp_dns(output: str) -> list[str]:
+    """DNS servers from ``ipconfig getpacket <iface>`` output, in order."""
+    m = _DNS_RE.search(output)
+    if not m:
+        return []
+    return [s.strip() for s in m.group(1).split(",") if s.strip()]
 
 
 class MacOSBackend(Backend):
@@ -92,13 +131,31 @@ class MacOSBackend(Backend):
     def network_id(self) -> str | None:
         # macOS 15+ redacts the SSID without Location Services, so identify the
         # network by its default gateway (IP + MAC) on this interface instead.
-        out = run("route", "-n", "get", "-ifscope", self.interface, "default", check=False)
-        gw = re.search(r"gateway:\s*(\S+)", out)
-        if not gw:
+        gw = self.gateway()
+        if gw is None:
             return None
-        arp = run("arp", "-n", gw.group(1), check=False)
+        arp = run("arp", "-n", gw, check=False)
         gw_mac = re.search(r" at ([0-9a-f:]+) ", arp)
-        return f"{gw.group(1)}@{gw_mac.group(1) if gw_mac else '?'}"
+        return f"{gw}@{gw_mac.group(1) if gw_mac else '?'}"
+
+    def gateway(self) -> str | None:
+        out = run("route", "-n", "get", "-ifscope", self.interface, "default", check=False)
+        return parse_route_gateway(out)
+
+    def neighbours(self) -> dict[str, set[str]]:
+        return parse_arp(run("arp", "-an", check=False), self.interface)
+
+    def dhcp_dns(self) -> list[str]:
+        return parse_dhcp_dns(run("ipconfig", "getpacket", self.interface, check=False))
+
+    def ssid(self) -> str | None:
+        # macOS redacts the SSID and BSSID from command-line tools unless the
+        # calling app has Location Services access, so they are reported as unknown.
+        return None
+
+    def bssid(self) -> str | None:
+        # Redacted on macOS as well; see ssid().
+        return None
 
     def get_hostname(self) -> dict[str, str | None]:
         names: dict[str, str | None] = {}

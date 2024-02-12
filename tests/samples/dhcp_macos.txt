@@ -1,0 +1,9 @@
+op = BOOTREPLY
+htype = 1
+yiaddr = 192.0.2.77
+server_identifier (ip): 192.0.2.1
+lease_time (uint32): 0x1c20
+subnet_mask (ip): 255.255.255.0
+router (ip_mult): {192.0.2.1}
+domain_name_server (ip_mult): {192.0.2.53, 192.0.2.1}
+end (none):

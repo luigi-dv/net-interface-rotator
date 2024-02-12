@@ -73,3 +73,27 @@ class Backend(ABC):
 
         Keys missing from ``previous`` are left alone.
         """
+
+    @abstractmethod
+    def gateway(self) -> str | None:
+        """The default gateway IP on this interface, or None when there is none."""
+
+    @abstractmethod
+    def neighbours(self) -> dict[str, set[str]]:
+        """IP -> MAC addresses seen for it on this interface.
+
+        MACs are normalized with ``rotator.mac.normalize``. Incomplete and
+        FAILED entries are skipped. Only this interface's entries are returned.
+        """
+
+    @abstractmethod
+    def dhcp_dns(self) -> list[str]:
+        """DNS servers handed out by DHCP on this interface, in order."""
+
+    @abstractmethod
+    def ssid(self) -> str | None:
+        """The Wi-Fi network name, or None when unknown or not on Wi-Fi."""
+
+    @abstractmethod
+    def bssid(self) -> str | None:
+        """The access-point MAC of the Wi-Fi network, or None when unknown."""
