@@ -17,18 +17,25 @@ PRIORITY = -10
 
 
 def build_rules(iface: str, tunnel_if: str | None, endpoints: list[tuple[str, int]],
-                allow_portal: bool) -> str:
+                allow_portal: bool, *, silent: bool = False) -> str:
     """The nft script for our table. Pure; output is deterministic.
 
     The leading ``add table`` / ``delete table`` pair makes the script replace
     any earlier copy of the table within a single atomic transaction.
+
+    ``silent=True`` is the ruleset for a session that has gone silent:
+    ``tunnel_if``, ``endpoints`` and ``allow_portal`` are ignored, so only
+    loopback and DHCP pass and a tunnel that is still running has no way out.
     """
     check_iface(iface)
-    if tunnel_if is not None:
-        check_iface(tunnel_if)
-        if tunnel_if == iface:
-            raise ValueError("Tunnel interface must differ from the physical interface")
-    eps = check_endpoints(endpoints)
+    if silent:
+        tunnel_if, eps, allow_portal = None, [], False
+    else:
+        if tunnel_if is not None:
+            check_iface(tunnel_if)
+            if tunnel_if == iface:
+                raise ValueError("Tunnel interface must differ from the physical interface")
+        eps = check_endpoints(endpoints)
 
     i, o = f'iifname "{iface}"', f'oifname "{iface}"'
     v4 = "meta nfproto ipv4"

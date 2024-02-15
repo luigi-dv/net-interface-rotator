@@ -30,9 +30,13 @@ GOLDENS = {
     "nft_strict": lambda: linux_nft.build_rules("wlan0", "wg0", STRICT_ENDPOINTS, False),
     "nft_strict_no_tunnel": lambda: linux_nft.build_rules("wlan0", None, STRICT_ENDPOINTS, False),
     "nft_portal": lambda: linux_nft.build_rules("wlan0", None, PORTAL_ENDPOINTS, True),
+    # silent ignores the tunnel interface, the endpoints and the portal flag.
+    "pf_silent": lambda: macos_pf.build_rules("en0", "utun5", STRICT_ENDPOINTS, True, silent=True),
+    "nft_silent": lambda: linux_nft.build_rules("wlan0", "wg0", STRICT_ENDPOINTS, True, silent=True),
 }
 STRICT = ["pf_strict", "pf_strict_no_tunnel", "nft_strict", "nft_strict_no_tunnel"]
 PORTAL = ["pf_portal", "nft_portal"]
+SILENT = ["pf_silent", "nft_silent"]
 
 
 def _golden(name: str, text: str) -> str:
@@ -217,3 +221,58 @@ def test_portal_keeps_ipv6_blocked_on_iface(name):
         for chain in ("input", "output"):
             rules = _nft_chains(text)[chain]
             assert not any("ip6" in _tokens(r) or "ipv6" in _tokens(r) for r in rules)
+
+
+# ------------------------------------------------------------ silent goldens
+
+def test_pf_silent_passes_only_dhcp_on_iface():
+    text = _read("pf_silent")
+    iface_lines, passes = _pf_passes_on_iface(text)
+    assert [_tokens(l) for l in passes] == [
+        ["pass", "out", "quick", "on", "en0", "inet", "proto", "udp", *PF_DHCP, "keep", "state"]]
+    assert "block drop quick on en0 inet6 all" in text.splitlines()
+    assert _tokens(iface_lines[-1]) == ["block", "drop", "quick", "on", "en0", "all"]
+    # Apart from the interface's own rules, loopback is the only thing passed.
+    others = [l for l in text.splitlines() if l not in iface_lines]
+    assert others == ["pass quick on lo0 all no state"]
+
+
+def test_nft_silent_accepts_only_dhcp_on_iface():
+    chains = _nft_chains(_read("nft_silent"))
+    assert set(chains) == {"input", "output", "forward"}
+    assert [_tokens(r) for r in chains["input"]] == [
+        ["iifname", "lo", "accept"],
+        ["iifname", "wlan0", "meta", "nfproto", "ipv4", *NFT_DHCP_IN, "ct", "state",
+         "established", "accept"],
+        ["iifname", "wlan0", "drop"],
+    ]
+    assert [_tokens(r) for r in chains["output"]] == [
+        ["oifname", "lo", "accept"],
+        ["oifname", "wlan0", "meta", "nfproto", "ipv4", *NFT_DHCP_OUT, "accept"],
+        ["oifname", "wlan0", "drop"],
+    ]
+    assert [_tokens(r) for r in chains["forward"]] == [
+        ["iifname", "wlan0", "drop"], ["oifname", "wlan0", "drop"]]
+
+
+@pytest.mark.parametrize("name", SILENT)
+def test_silent_has_no_tunnel_endpoint_or_portal_rule(name):
+    tokens = {tok for line in _read(name).splitlines() for tok in _tokens(line)}
+    forbidden = {"utun5", "wg0", "53", "80", "443", "tcp"}
+    forbidden |= {ep[0] for ep in STRICT_ENDPOINTS} | {str(ep[1]) for ep in STRICT_ENDPOINTS}
+    assert forbidden.isdisjoint(tokens)
+
+
+def test_silent_ignores_its_other_arguments():
+    assert macos_pf.build_rules("en0", None, [], False, silent=True) == _read("pf_silent")
+    assert linux_nft.build_rules("wlan0", None, [], False, silent=True) == _read("nft_silent")
+    for build in (macos_pf.build_rules, linux_nft.build_rules):
+        with pytest.raises(ValueError):
+            build("en0; pass all", None, [], False, silent=True)
+
+
+def test_silent_rules_are_loadable(monkeypatch):
+    """Both loaders refuse rules without their block/drop; silent rules have it."""
+    assert macos_pf._BLOCK_ALL.search(_read("pf_silent")).group(1) == "en0"
+    nft = _read("nft_silent")
+    assert f"table {linux_nft.FAMILY} {linux_nft.TABLE} {{" in nft and " drop" in nft

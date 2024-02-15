@@ -1,0 +1,23 @@
+add table inet net_interface_rotator
+delete table inet net_interface_rotator
+table inet net_interface_rotator {
+	chain input {
+		type filter hook input priority -10; policy accept;
+		iifname "lo" accept
+		iifname "wlan0" meta nfproto ipv4 udp sport 67 udp dport 68 ct state established accept
+		iifname "wlan0" drop
+	}
+
+	chain output {
+		type filter hook output priority -10; policy accept;
+		oifname "lo" accept
+		oifname "wlan0" meta nfproto ipv4 udp sport 68 udp dport 67 accept
+		oifname "wlan0" drop
+	}
+
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+		iifname "wlan0" drop
+		oifname "wlan0" drop
+	}
+}

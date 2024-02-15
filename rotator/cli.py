@@ -1,4 +1,4 @@
-"""Command-line interface: status, rotate, restore, watch."""
+"""Command-line interface: status, rotate, restore, watch, session, audit, panic."""
 import argparse
 import os
 import signal
@@ -126,6 +126,92 @@ def cmd_watch(backend: Backend, args) -> None:
         log("Stopped.")
 
 
+def _duration(text: str) -> float:
+    from . import session
+    try:
+        return session.parse_duration(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _exit_with(call) -> None:
+    """Run a session-level action and turn its result into an exit status."""
+    from . import journal, session
+    try:
+        code = call()
+    except (session.SessionError, journal.JournalError) as e:
+        sys.exit(f"Error: {e}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+    if code:
+        sys.exit(code)
+
+
+def session_options(args, environ=None):
+    """Build ``session.Options`` from parsed arguments and the environment."""
+    from . import session
+    environ = os.environ if environ is None else environ
+    config = (environ.get("WG_CONFIG") or "").strip()
+    if not config:
+        sys.exit(
+            "WG_CONFIG is not set. Put the path of your WireGuard config in .env "
+            "(see .env.example), for example WG_CONFIG=/etc/wireguard/nir.conf.")
+    return session.Options(
+        interface=args.interface,
+        duration=args.duration,
+        config=config,
+        fallback=(environ.get("WG_CONFIG_FALLBACK") or "").strip() or None,
+        portal=args.portal,
+        portal_seconds=args.portal_seconds,
+        strict=args.strict,
+        keep_hostname=args.keep_hostname,
+        keep_firewall=args.keep_firewall,
+        poll=args.poll,
+    )
+
+
+def cmd_session(backend: Backend, args) -> None:
+    from . import journal, session
+    require_root()
+    if args.session_command == "start":
+        options = session_options(args)
+        _exit_with(lambda: session.start(
+            options, backend_factory=get_backend, notifier=session.notify,
+            clock=time.time, sleep=time.sleep))
+    elif args.session_command == "stop":
+        _exit_with(lambda: session.stop_running(get_backend))
+    else:
+        def show() -> int:
+            data = session.status()
+            if data is not None:
+                print(session.format_status(data, time.time()))
+                return 0
+            print("No session is running.")
+            left = len(journal.pending())
+            if left:
+                print(f"{left} change(s) from an earlier session are still applied. "
+                      f"Run `{session.PANIC_HINT}` to undo them.")
+            return 0
+        _exit_with(show)
+
+
+def cmd_audit(backend: Backend, _args) -> None:
+    from . import audit, session
+    require_root()
+
+    def check() -> int:
+        results = audit.run_checks(session.audit_context(backend))
+        print(audit.format_table(results))
+        return 0 if audit.all_ok(results) else 1
+    _exit_with(check)
+
+
+def cmd_panic(_backend: Backend, _args) -> None:
+    from . import session
+    require_root()
+    _exit_with(lambda: session.panic(get_backend))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="net-interface-rotator", description=__doc__)
     p.add_argument("-i", "--interface", default=os.getenv("NETWORK_INTERFACE") or DEFAULT_INTERFACE)
@@ -148,10 +234,36 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Ignore network changes for N seconds after a rotation (default 30)")
     w.add_argument("--rotate-now", action="store_true", help="Rotate once at startup")
     w.add_argument("--restore-on-exit", action="store_true", help="Restore the saved MAC on Ctrl-C")
+
+    s = sub.add_parser("session", help="Protected, fully reversible session on an untrusted network")
+    ssub = s.add_subparsers(dest="session_command", required=True)
+    st = ssub.add_parser("start", help="Set everything up, hold it for --duration, then undo it all")
+    st.add_argument("--duration", type=_duration, required=True,
+                    help="How long to hold the session: 90s, 15m, 2h")
+    st.add_argument("--portal", action="store_true",
+                    help="Open a short, UNPROTECTED window first to log in to a captive portal")
+    st.add_argument("--portal-seconds", type=float, default=120,
+                    help="Longest the portal window may stay open (default 120)")
+    st.add_argument("--strict", action=argparse.BooleanOptionalAction, default=None,
+                    help="On a confirmed hostile-network finding, stop the tunnel and block all "
+                         "traffic (default: STRICT in .env, else on)")
+    st.add_argument("--keep-hostname", action="store_true", help="Do not randomize the host name")
+    st.add_argument("--keep-firewall", action="store_true",
+                    help="Do not change the inbound firewall settings")
+    st.add_argument("--poll", type=float, default=3,
+                    help="Seconds between network and tunnel checks (default 3)")
+    ssub.add_parser("stop", help="Stop the running session and undo its changes")
+    ssub.add_parser("status", help="Show time left, tunnel and kill-switch state, and findings")
+
+    sub.add_parser("audit", help="Read-only leak checks; exits 1 if any fails")
+    sub.add_parser("panic", help="Undo every recorded change, even after a crash or reboot")
     return p
 
 
-COMMANDS = {"status": cmd_status, "rotate": cmd_rotate, "restore": cmd_restore, "watch": cmd_watch}
+COMMANDS = {
+    "status": cmd_status, "rotate": cmd_rotate, "restore": cmd_restore, "watch": cmd_watch,
+    "session": cmd_session, "audit": cmd_audit, "panic": cmd_panic,
+}
 
 
 def main(argv: list[str] | None = None) -> None:

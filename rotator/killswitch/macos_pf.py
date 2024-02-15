@@ -21,13 +21,25 @@ _BLOCK_ALL = re.compile(r"^block drop quick on (\S+) all$", re.MULTILINE)
 
 
 def build_rules(iface: str, tunnel_if: str | None, endpoints: list[tuple[str, int]],
-                allow_portal: bool) -> str:
+                allow_portal: bool, *, silent: bool = False) -> str:
     """The pf ruleset for our anchor. Pure; output is deterministic.
 
     Every rule is ``quick``: the first match decides, and the final two rules
     block everything else on ``iface``. Replies pass through pf state only.
+
+    ``silent=True`` is the ruleset for a session that has gone silent:
+    ``tunnel_if``, ``endpoints`` and ``allow_portal`` are ignored, so only
+    loopback and outbound DHCP pass and a tunnel that is still running has
+    no way out. States opened earlier outlive a reload; see ``drop_states``.
     """
     check_iface(iface)
+    if silent:
+        return "\n".join([
+            f"pass quick on {LOOPBACK} all no state",
+            f"pass out quick on {iface} inet proto udp from any port 68 to any port 67 keep state",
+            f"block drop quick on {iface} inet6 all",
+            f"block drop quick on {iface} all",
+        ]) + "\n"
     if tunnel_if is not None:
         check_iface(tunnel_if)
         if tunnel_if == iface:
@@ -137,6 +149,30 @@ def unload(undo: dict) -> list[str]:
     if flush_error is not None:
         raise flush_error
     return warnings
+
+
+def drop_states(iface: str) -> None:
+    """Drop every pf state on ``iface``, so flows that an earlier ruleset
+    let through (the tunnel's own packets to its endpoint) cannot carry on
+    under a stricter one. ``load`` does this itself on the first load only."""
+    _pfctl("-i", check_iface(iface), "-F", "states")
+
+
+def release_token(token) -> list[str]:
+    """Release one pf enable reference and touch nothing else.
+
+    For callers that journal the token separately from the anchor (the anchor
+    entry is then undone with ``unload`` and no token). Like ``unload``, a
+    token pf no longer knows is a warning, so releasing twice is harmless.
+    """
+    if not str(token).isdigit():
+        raise BackendError("pf enable token is not a number")
+    result = _pfctl("-X", str(token), check=False)
+    if result.returncode != 0:
+        return [
+            f"pfctl -X could not release the enable token: "
+            f"{result.stderr.strip() or result.returncode}"]
+    return []
 
 
 def is_loaded() -> bool:

@@ -30,8 +30,13 @@ def remember_original(interface: str, mac: str) -> None:
         return
     data[interface] = mac
     path = _state_path()
+    # The file holds the original MAC address, so only its owner may read it.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
+    os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        os.fchmod(fd, 0o600)  # an older, wider file is tightened too
+        handle.write(json.dumps(data, indent=2))
     sudo_uid, sudo_gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
     if sudo_uid and sudo_gid:
         for p in (path.parent, path):

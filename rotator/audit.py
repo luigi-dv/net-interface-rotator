@@ -32,6 +32,7 @@ class AuditContext:
     tunnel_dns: tuple[str, ...]          # DNS servers from the WireGuard config
     original_mac: str | None             # from the journal; None if unknown
     original_hostnames: dict | None      # from the journal; None if unknown
+    manage_inbound: bool = True          # False with --keep-firewall
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,8 @@ def check_hostname_changed(ctx: AuditContext, runner=run, *, killswitch=None,
 def check_inbound_blocked(ctx: AuditContext, runner=run, *, killswitch=None,
                           platform: str = sys.platform) -> CheckResult:
     name = "inbound_blocked"
+    if not ctx.manage_inbound:
+        return CheckResult(name, True, "not managed this session")
     kind = _platform_kind(platform)
     if kind == "linux":
         loaded = bool(killswitch.is_loaded())
