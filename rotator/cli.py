@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from . import mac as macmod
 from . import state
@@ -29,10 +29,12 @@ def rotate(backend: Backend, new_mac: str | None = None, journal=None) -> str:
     ``journal`` is the ``rotator.journal`` module (or an object with the same
     ``record``) when called from a session: the address in use is journaled,
     and synced to disk, before it is replaced, so ``journal.rollback`` can put
-    it back. Standalone ``rotate`` passes nothing and relies on ``state`` alone.
+    it back. A session keeps the original only in that root-only journal.
+    Standalone ``rotate`` passes nothing and remembers it in ``state``.
     """
     current = backend.current_mac()
-    state.remember_original(backend.interface, current)
+    if journal is None:
+        state.remember_original(backend.interface, current)
     target = macmod.normalize(new_mac) if new_mac else macmod.generate(exclude=current)
     if journal is not None:
         journal.record("mac", {"interface": backend.interface, "mac": current})
@@ -266,12 +268,34 @@ COMMANDS = {
 }
 
 
+# The only settings read from `.env`. The tool runs as root, so nothing else in
+# that file (PATH, WG_QUICK_USERSPACE_IMPLEMENTATION, ...) may reach the
+# environment of this process or of the commands it starts.
+ENV_KEYS = (
+    "NETWORK_INTERFACE", "ROTATE_INTERVAL", "POLL_SECONDS",
+    "WG_CONFIG", "WG_CONFIG_FALLBACK", "STRICT", "STRICT_ON",
+)
+
+
+def load_env(dotenv_path=None, environ=None) -> None:
+    """Copy the known settings from `.env` into the environment.
+
+    A variable that is already set wins. Every other key in the file is ignored.
+    """
+    environ = os.environ if environ is None else environ
+    values = dotenv_values(dotenv_path)
+    for key in ENV_KEYS:
+        value = values.get(key)
+        if value is not None and key not in environ:
+            environ[key] = value
+
+
 def main(argv: list[str] | None = None) -> None:
-    load_dotenv()
+    load_env()
     args = build_parser().parse_args(argv)
     try:
         COMMANDS[args.command](get_backend(args.interface), args)
-    except BackendError as e:
+    except (BackendError, OSError) as e:
         sys.exit(f"Error: {e}")
 
 

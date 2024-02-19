@@ -124,7 +124,7 @@ class MacOSBackend(Backend):
                 return
             time.sleep(0.5)
         raise BackendError(
-            f"{self.interface} still reports {self.current_mac()} instead of {mac}. "
+            f"{self.interface} did not accept the new address. "
             "The driver may not allow MAC changes."
         )
 

@@ -1,6 +1,10 @@
 """WireGuard tunnel: check the user's wg-quick config, then start, stop and
 verify it. All encryption is WireGuard's own; this module only orchestrates.
 
+A session never hands the user's own file to ``wg-quick``: ``stage_config``
+checks it and copies the checked bytes to a root-only directory, and the
+copy is what is parsed, started and stopped.
+
 The private key is never stored, returned, raised or logged: the parser
 skips secret values, error messages name line numbers and keys only, and
 output from ``wg-quick`` is scrubbed before it reaches an exception.
@@ -8,6 +12,7 @@ output from ``wg-quick`` is scrubbed before it reaches an exception.
 import ipaddress
 import os
 import re
+import secrets
 import stat
 import sys
 import time
@@ -22,7 +27,12 @@ _POLL_SECONDS = 0.5
 _NAME_DIR = Path("/var/run/wireguard")  # macOS: wg-quick writes <name>.name here
 
 _SECRET_KEYS = {"privatekey", "presharedkey"}
-_IF_NAME = re.compile(r"[A-Za-z0-9_=+.-]{1,15}")
+# Same rule as the kill switch's interface names, so a config name that
+# passes here cannot be refused later, after the system has been changed.
+_IF_NAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+_NAME_RULE = ("WireGuard config must be named <name>.conf, where <name> is at most 15 "
+              "letters, digits or `_.-`.")
+_MAX_CONFIG_BYTES = 1 << 20
 _ENDPOINT_V4 = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})")
 _ENDPOINT_V6 = re.compile(r"\[([0-9A-Fa-f:.]+)\]:(\d{1,5})")
 _KEY_LIKE = re.compile(r"[A-Za-z0-9+/]{42,43}=")
@@ -31,7 +41,14 @@ _HOOK_KEYS = (("preup", "PreUp"), ("postup", "PostUp"), ("predown", "PreDown"), 
 
 
 class ConfigError(ValueError):
-    """The config cannot be used. The message never contains file contents."""
+    """The config cannot be used. The message never contains file contents.
+
+    ``problems`` holds the separate reasons, when there are several.
+    """
+
+    def __init__(self, message: str, problems=()):
+        super().__init__(message)
+        self.problems = list(problems) or [message]
 
 
 @dataclass(frozen=True)
@@ -240,6 +257,115 @@ def validate_file(config_path, local_networks=()) -> list[str]:
         return validate(handle.read(), file_stat, local_networks)
 
 
+def _refused(src, problems) -> ConfigError:
+    return ConfigError(
+        f"WireGuard config {src} cannot be used:\n" + "\n".join(f"  - {p}" for p in problems),
+        problems)
+
+
+def _read_source(src) -> tuple[bytes | None, object, list[str]]:
+    """Read ``src`` once. Returns (bytes, fstat of the same open file, problems)."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(str(src), flags)
+    except OSError as e:
+        return None, None, [f"Cannot open config file {src}: {e.strerror}."]
+    with os.fdopen(fd, "rb") as handle:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None, None, [f"Config {src} is not a regular file."]
+        try:
+            data = handle.read(_MAX_CONFIG_BYTES + 1)
+        except OSError as e:
+            return None, None, [f"Cannot read config file {src}: {e.strerror}."]
+    if len(data) > _MAX_CONFIG_BYTES:
+        return None, None, [f"Config {src} is too large to be a WireGuard config."]
+    return data, file_stat, []
+
+
+def _open_stage_dir(dest_dir) -> int:
+    """Open the staging directory; it must be a real directory that only the
+    current user (root, in a session) can enter or write."""
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        fd = os.open(str(dest_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise ConfigError(f"Cannot use staging directory {dest_dir}: {e.strerror}.") from None
+    info = os.fstat(fd)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(fd)
+        raise ConfigError(
+            f"Staging directory {dest_dir} must be owned by the user running the "
+            f"tool and have mode 0700.")
+    return fd
+
+
+def _write_staged(dir_fd: int, name: str, data: bytes) -> None:
+    """Put ``data`` at ``name`` inside ``dir_fd``, replacing an older copy in
+    one step. The new file is created exclusively and is never a link."""
+    temp = f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(fd, 0o600)
+            handle.write(data)
+            handle.flush()
+            os.fsync(fd)
+        os.replace(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(temp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+
+
+def stage_config(src_path, dest_dir, local_networks=(), owner_uid: int | None = None) -> Path:
+    """Check the user's config and copy it to a place only root can change.
+
+    The file is opened once, without following a symbolic link; the bytes
+    read from that descriptor are the bytes ``validate`` checks (together
+    with the descriptor's own ``fstat``) and the bytes written to
+    ``dest_dir/<same file name>``. Nothing is read from ``src_path`` again,
+    so editing or swapping it afterwards changes nothing: callers must pass
+    the returned path to ``parse_config``, ``up`` and ``down``.
+
+    ``dest_dir`` must be a directory owned by the current user with mode
+    0700; it is created if missing. The staged copy has mode 0600 and
+    replaces an older copy of the same name atomically.
+
+    Raises ``ConfigError`` (``.problems`` lists each reason) if the name, the
+    file or its contents are refused, or if the copy cannot be written.
+    Nothing is staged in that case. ``local_networks`` and ``owner_uid`` are
+    passed to ``validate``.
+    """
+    src = Path(src_path)
+    if src.suffix != ".conf" or not _IF_NAME.fullmatch(src.stem):
+        raise _refused(src, [_NAME_RULE])
+    data, file_stat, problems = _read_source(src)
+    if data is not None:
+        if b"\0" in data:
+            problems.append("Config contains a NUL byte.")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            problems.append("Config is not valid UTF-8 text.")
+            text = data.decode("utf-8", errors="replace")
+        problems += validate(text, file_stat, local_networks, owner_uid)
+    if problems:
+        raise _refused(src, problems)
+
+    dir_fd = _open_stage_dir(dest_dir)
+    try:
+        _write_staged(dir_fd, src.name, data)
+    except OSError as e:
+        raise ConfigError(
+            f"Cannot stage WireGuard config in {dest_dir}: {e.strerror}.") from None
+    finally:
+        os.close(dir_fd)
+    return Path(dest_dir) / src.name
+
+
 def parse_latest_handshakes(output: str, now: float) -> float | None:
     """Age in seconds of the newest handshake in ``wg show <if>
     latest-handshakes`` output, or None if no peer has ever completed one."""
@@ -259,9 +385,7 @@ def tunnel_name(config_path) -> str:
     """The wg-quick interface name: the config's file stem."""
     path = Path(config_path)
     if path.suffix != ".conf" or not _IF_NAME.fullmatch(path.stem):
-        raise BackendError(
-            "WireGuard config must be named <name>.conf, where <name> is at most 15 "
-            "letters, digits or `_=+.-`.")
+        raise BackendError(_NAME_RULE)
     return path.stem
 
 

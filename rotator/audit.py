@@ -152,7 +152,9 @@ def check_default_route_via_tunnel(ctx: AuditContext, runner=run, *, killswitch=
         return CheckResult(name, False, "no tunnel interface")
     kind = _platform_kind(platform)
     if kind == "darwin":
-        via = _macos_route_iface(runner, "default")
+        # Not `default`: wg-quick on macOS adds 0.0.0.0/1 and 128.0.0.0/1 and
+        # leaves the default route on the physical interface.
+        via = _macos_route_iface(runner, _ROUTE_PROBE_IP)
     elif kind == "linux":
         via = _linux_route_dev(runner, _ROUTE_PROBE_IP)
     else:

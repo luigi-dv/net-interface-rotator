@@ -202,6 +202,191 @@ def test_validate_file(tmp_path, monkeypatch):
     only(tunnel.validate_file(link), "Cannot open")
 
 
+# ------------------------------------------------------------ stage_config
+
+@pytest.fixture
+def user_conf(tmp_path, monkeypatch):
+    """A good config owned by the current user, as the user would keep it."""
+    monkeypatch.delenv("SUDO_UID", raising=False)
+    path = tmp_path / "user" / "nir.conf"
+    path.parent.mkdir()
+    path.write_text(GOOD)
+    path.chmod(0o600)
+    return path
+
+
+@pytest.fixture
+def stage_dir(tmp_path):
+    path = tmp_path / "stage"
+    path.mkdir(mode=0o700)
+    return path
+
+
+def test_stage_config_copies_checked_bytes(user_conf, stage_dir):
+    staged = tunnel.stage_config(user_conf, stage_dir)
+    assert staged == stage_dir / "nir.conf"
+    assert staged.read_bytes() == GOOD.encode()
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert not staged.is_symlink()
+    assert [p.name for p in stage_dir.iterdir()] == ["nir.conf"]  # no temp file left
+    assert tunnel.validate_file(staged) == []
+    assert tunnel.tunnel_name(staged) == "nir"
+
+
+def test_stage_config_creates_missing_stage_dir(user_conf, tmp_path):
+    stage_dir = tmp_path / "run" / "stage"
+    staged = tunnel.stage_config(user_conf, stage_dir)
+    assert staged.read_bytes() == GOOD.encode()
+    assert stat.S_IMODE(stage_dir.stat().st_mode) == 0o700
+
+
+def test_stage_config_later_edits_to_the_source_change_nothing(user_conf, stage_dir):
+    staged = tunnel.stage_config(user_conf, stage_dir)
+    # After validation the user's file gains a root hook and another endpoint.
+    user_conf.write_text(GOOD.replace("[Interface]\n", "[Interface]\nPostUp = /bin/echo marker\n")
+                         .replace("192.0.2.10", "203.0.113.66"))
+    text = staged.read_text()
+    assert "PostUp" not in text
+    assert tunnel.parse_config(text).endpoint_ip == "192.0.2.10"
+
+
+def test_stage_config_validates_the_bytes_it_read_not_the_path(user_conf, stage_dir, monkeypatch):
+    # The path is swapped for a hostile file between the read and the check.
+    real_validate = tunnel.validate
+    seen = []
+
+    def swapping_validate(text, file_stat, *args, **kwargs):
+        user_conf.write_text(GOOD.replace("[Interface]\n", "[Interface]\nPostUp = /bin/echo marker\n"))
+        seen.append(text)
+        return real_validate(text, file_stat, *args, **kwargs)
+
+    monkeypatch.setattr(tunnel, "validate", swapping_validate)
+    staged = tunnel.stage_config(user_conf, stage_dir)
+    assert seen == [GOOD]
+    assert staged.read_text() == GOOD
+
+
+def test_stage_config_reads_the_source_exactly_once(user_conf, stage_dir, monkeypatch):
+    real_open = os.open
+    opened = []
+
+    def counting_open(path, flags, *args, **kwargs):
+        if str(path) == str(user_conf):
+            opened.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(tunnel.os, "open", counting_open)
+    tunnel.stage_config(user_conf, stage_dir)
+    assert len(opened) == 1
+    assert opened[0] & os.O_NOFOLLOW
+
+
+def test_stage_config_refuses_invalid_config_and_stages_nothing(user_conf, stage_dir):
+    user_conf.write_text(GOOD.replace("[Interface]\n", "[Interface]\nPostUp = /bin/echo marker-text\n")
+                         .replace("PersistentKeepalive = 25\n", ""))
+    with pytest.raises(tunnel.ConfigError) as err:
+        tunnel.stage_config(user_conf, stage_dir)
+    assert len(err.value.problems) == 2
+    assert "PostUp" in str(err.value) and "PersistentKeepalive" in str(err.value)
+    assert "marker-text" not in str(err.value) and KEY not in str(err.value)
+    assert list(stage_dir.iterdir()) == []
+
+
+def test_stage_config_checks_mode_of_the_opened_file(user_conf, stage_dir):
+    user_conf.chmod(0o644)
+    with pytest.raises(tunnel.ConfigError, match="mode"):
+        tunnel.stage_config(user_conf, stage_dir)
+
+
+def test_stage_config_passes_local_networks_and_owner(user_conf, stage_dir):
+    with pytest.raises(tunnel.ConfigError, match="198.51.100.1"):
+        tunnel.stage_config(user_conf, stage_dir, local_networks=["198.51.100.0/24"])
+    with pytest.raises(tunnel.ConfigError, match="owned"):
+        tunnel.stage_config(user_conf, stage_dir, owner_uid=os.getuid() + 1)
+    assert list(stage_dir.iterdir()) == []
+
+
+def test_stage_config_refuses_symlinked_source(user_conf, stage_dir):
+    link = user_conf.parent / "link.conf"
+    link.symlink_to(user_conf)
+    with pytest.raises(tunnel.ConfigError, match="Cannot open"):
+        tunnel.stage_config(link, stage_dir)
+    with pytest.raises(tunnel.ConfigError, match="Cannot open"):
+        tunnel.stage_config(user_conf.parent / "missing.conf", stage_dir)
+    assert list(stage_dir.iterdir()) == []
+
+
+def test_stage_config_refuses_non_regular_source(tmp_path, stage_dir):
+    fifo = tmp_path / "pipe.conf"
+    os.mkfifo(fifo, 0o600)
+    with pytest.raises(tunnel.ConfigError, match="not a regular file"):
+        tunnel.stage_config(fifo, stage_dir)  # must not block either
+
+
+@pytest.mark.parametrize("name", ["a+b.conf", "a=b.conf", "a b.conf", "nir",
+                                  "much-too-long-a-name.conf", "nir.txt"])
+def test_stage_config_refuses_names_the_kill_switch_would_refuse(user_conf, stage_dir, name):
+    src = user_conf.with_name(name)
+    user_conf.rename(src)
+    with pytest.raises(tunnel.ConfigError, match="must be named"):
+        tunnel.stage_config(src, stage_dir)
+    assert list(stage_dir.iterdir()) == []
+
+
+def test_stage_config_refuses_nul_bytes_and_bad_utf8(user_conf, stage_dir):
+    user_conf.write_bytes(GOOD.encode() + b"# \xff\n")
+    with pytest.raises(tunnel.ConfigError, match="UTF-8"):
+        tunnel.stage_config(user_conf, stage_dir)
+    # bash drops NUL bytes when wg-quick reads the file, so this is a PostUp.
+    user_conf.write_bytes(GOOD.replace("[Interface]\n", "[Interface]\nPost\0Up = x\n").encode())
+    with pytest.raises(tunnel.ConfigError, match="NUL"):
+        tunnel.stage_config(user_conf, stage_dir)
+    assert list(stage_dir.iterdir()) == []
+
+
+def test_stage_config_replaces_previous_copy_without_following_links(user_conf, stage_dir, tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep me")
+    (stage_dir / "nir.conf").symlink_to(victim)
+    staged = tunnel.stage_config(user_conf, stage_dir)
+    assert not staged.is_symlink()
+    assert staged.read_text() == GOOD
+    assert victim.read_text() == "keep me"
+
+    user_conf.write_text(GOOD.replace("192.0.2.10", "192.0.2.11"))
+    staged = tunnel.stage_config(user_conf, stage_dir)
+    assert tunnel.parse_config(staged.read_text()).endpoint_ip == "192.0.2.11"
+    assert [p.name for p in stage_dir.iterdir()] == ["nir.conf"]
+
+
+def test_stage_config_refuses_open_or_linked_stage_dir(user_conf, stage_dir, tmp_path):
+    stage_dir.chmod(0o755)
+    with pytest.raises(tunnel.ConfigError, match="0700"):
+        tunnel.stage_config(user_conf, stage_dir)
+    stage_dir.chmod(0o700)
+    link = tmp_path / "stage-link"
+    link.symlink_to(stage_dir, target_is_directory=True)
+    with pytest.raises(tunnel.ConfigError, match="staging directory"):
+        tunnel.stage_config(user_conf, link)
+    assert list(stage_dir.iterdir()) == []
+
+
+def test_stage_config_refuses_stage_dir_owned_by_someone_else(user_conf, stage_dir, monkeypatch):
+    monkeypatch.setattr(tunnel.os, "geteuid", lambda: os.getuid() + 1)
+    with pytest.raises(tunnel.ConfigError, match="owned"):
+        tunnel.stage_config(user_conf, stage_dir, owner_uid=os.getuid())
+
+
+def test_stage_config_write_failure_leaves_no_temp_file(user_conf, stage_dir, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tunnel.os, "replace", fail)
+    with pytest.raises(tunnel.ConfigError, match="Cannot stage"):
+        tunnel.stage_config(user_conf, stage_dir)
+    assert list(stage_dir.iterdir()) == []
+
+
 # ------------------------------------------------------------- handshakes
 
 def test_parse_latest_handshakes():
@@ -262,7 +447,8 @@ def test_up_macos_reads_real_interface_name(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("path", ["/etc/wireguard/nir", "/etc/wireguard/a b.conf",
-                                  "/etc/wireguard/much-too-long-a-name.conf"])
+                                  "/etc/wireguard/much-too-long-a-name.conf",
+                                  "/etc/wireguard/a+b.conf", "/etc/wireguard/a=b.conf"])
 def test_up_rejects_bad_config_name(monkeypatch, path):
     monkeypatch.setattr(tunnel, "run", lambda *a, check=True: pytest.fail("must not run"))
     with pytest.raises(BackendError):

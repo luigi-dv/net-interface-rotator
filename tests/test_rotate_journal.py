@@ -53,10 +53,15 @@ def test_rotate_journals_previous_mac_before_set_mac():
     assert journal.pending() == seen
 
 
-def test_rotate_with_journal_still_remembers_original_in_state():
+def test_rotate_with_journal_never_touches_state(monkeypatch, tmp_files):
+    # A session keeps the original only in the root-only journal: nothing is
+    # written into the user's home.
+    monkeypatch.setattr(state, "remember_original",
+                        lambda *a: pytest.fail("state must not be written in a session"))
     backend = FakeBackend(mac=ORIGINAL)
     rotate(backend, journal=journal)
-    assert state.original_mac("en0") == ORIGINAL
+    assert state.original_mac("en0") is None
+    assert not (tmp_files / "state.json").exists()
 
 
 def test_rotate_with_bad_mac_journals_nothing():

@@ -15,9 +15,9 @@ ORIGINAL_HOSTNAMES = {"ComputerName": "Work Laptop", "LocalHostName": "Work-Lapt
 RANDOM_HOSTNAMES = {"ComputerName": "MacBook-Air", "LocalHostName": "MacBook-Air", "HostName": None}
 
 ROUTE_DEFAULT_UTUN = """\
-   route to: default
-destination: default
-       mask: default
+   route to: 192.0.2.1
+destination: 128.0.0.0
+       mask: 128.0.0.0
     gateway: 198.51.100.1
   interface: utun4
       flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
@@ -25,10 +25,10 @@ destination: default
 """
 
 ROUTE_DEFAULT_EN0 = """\
-   route to: default
+   route to: 192.0.2.1
 destination: default
        mask: default
-    gateway: 192.0.2.1
+    gateway: 192.0.2.254
   interface: en0
       flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
 """
@@ -287,13 +287,13 @@ def test_tunnel_up_fails_without_interface(monkeypatch):
 # --------------------------------------------------------- default_route_via_tunnel
 
 def test_default_route_macos_pass():
-    runner = FakeRunner({("route", "-n", "get", "default"): ROUTE_DEFAULT_UTUN})
+    runner = FakeRunner({("route", "-n", "get", "192.0.2.1"): ROUTE_DEFAULT_UTUN})
     result = audit.check_default_route_via_tunnel(make_ctx(macos_backend()), runner, platform="darwin")
     assert result.ok and "utun4" in result.detail
 
 
 def test_default_route_macos_fail():
-    runner = FakeRunner({("route", "-n", "get", "default"): ROUTE_DEFAULT_EN0})
+    runner = FakeRunner({("route", "-n", "get", "192.0.2.1"): ROUTE_DEFAULT_EN0})
     result = audit.check_default_route_via_tunnel(make_ctx(macos_backend()), runner, platform="darwin")
     assert not result.ok and "en0" in result.detail
 
@@ -313,7 +313,7 @@ def test_default_route_linux_fail():
 
 
 def test_default_route_unreadable_output_fails():
-    runner = FakeRunner({("route", "-n", "get", "default"): "route: not in table\n"})
+    runner = FakeRunner({("route", "-n", "get", "192.0.2.1"): "route: not in table\n"})
     result = audit.check_default_route_via_tunnel(make_ctx(macos_backend()), runner, platform="darwin")
     assert not result.ok
 
@@ -455,7 +455,7 @@ CHECK_NAMES = [
 def healthy_macos(monkeypatch):
     monkeypatch.setattr(tunnel, "is_up", lambda *a, **k: True)
     runner = macos_dns_runner(SCUTIL_DNS_TUNNEL, {"198.51.100.1": "utun4", "2001:db8:1::1": "utun4"})
-    runner.outputs[("route", "-n", "get", "default")] = ROUTE_DEFAULT_UTUN
+    runner.outputs[("route", "-n", "get", "192.0.2.1")] = ROUTE_DEFAULT_UTUN
     runner.outputs[("ifconfig", "en0")] = IFCONFIG_LINK_LOCAL_ONLY
     return make_ctx(macos_backend()), runner
 
@@ -482,7 +482,7 @@ def test_run_checks_all_pass_linux(monkeypatch, tmp_path):
 
 def test_run_checks_backend_error_fails_one_check_only(monkeypatch):
     ctx, runner = healthy_macos(monkeypatch)
-    runner.outputs[("route", "-n", "get", "default")] = BackendError("`route -n get default` failed: boom")
+    runner.outputs[("route", "-n", "get", "192.0.2.1")] = BackendError("`route -n get 192.0.2.1` failed: boom")
     results = audit.run_checks(ctx, runner=runner, killswitch=StubKillSwitch(True), platform="darwin")
     by_name = {r.name: r for r in results}
     assert [r.name for r in results] == CHECK_NAMES
@@ -504,7 +504,7 @@ def test_run_checks_os_error_from_resolv_conf_is_reported(monkeypatch, tmp_path)
 
 def test_run_checks_unexpected_exception_is_contained(monkeypatch):
     ctx, runner = healthy_macos(monkeypatch)
-    runner.outputs[("route", "-n", "get", "default")] = ValueError("odd output")
+    runner.outputs[("route", "-n", "get", "192.0.2.1")] = ValueError("odd output")
     results = audit.run_checks(ctx, runner=runner, killswitch=StubKillSwitch(True), platform="darwin")
     assert len(results) == len(CHECK_NAMES)
     assert not results[5].ok and "odd output" in results[5].detail
