@@ -1,6 +1,6 @@
 # Network Interface Rotator
 
-Protects one person's session on an untrusted public network with an encrypted WireGuard tunnel, a kill switch, a randomized hardware address and host name, and detection of hostile-network activity. When the session ends, it puts the machine back exactly as it was; it runs on macOS and Linux.
+Protects one person's session on an untrusted public network with an encrypted WireGuard tunnel, a kill switch, a randomized hardware address and host name, and detection of hostile-network activity. When you stop the session, it puts the machine back as it was. If the time runs out first, it blocks all traffic and waits for you to stop it. It runs on macOS and Linux.
 
 ## What it protects against, and what it doesn't
 
@@ -9,7 +9,7 @@ Protects one person's session on an untrusted public network with an encrypted W
 | Read unencrypted traffic, see DNS lookups | No. All traffic and DNS go through a WireGuard tunnel. |
 | Redirect traffic (ARP spoofing, rogue DHCP or DNS, fake access point) | No. Redirected packets are still encrypted and authenticated, so the attacker gains nothing. The tool also detects and reports it. |
 | Recognize the device by hardware address, hostname or open services | No. The address and host name are random for the session, and inbound connections are blocked. |
-| Catch traffic that leaks when the tunnel drops | No. A firewall kill switch blocks everything outside the tunnel. |
+| Catch traffic that leaks when the tunnel drops, or through a second interface | No. A firewall kill switch blocks every interface except the tunnel, so traffic cannot leave by another one. |
 | See that a device is present, how much data it sends, and that it uses a VPN | **Yes. This cannot be hidden.** |
 | Fingerprint the Wi-Fi radio hardware | **Yes. Out of scope.** |
 
@@ -124,6 +124,8 @@ If the tunnel does not connect within 15 seconds, the tool tries the fallback co
 
 ### Settings in `.env`
 
+Only the settings below are read from `.env`. Any other key in the file is ignored, so it cannot change `PATH` or other variables that the tool passes to commands it runs as root. A variable that is already set in the environment takes precedence over `.env`.
+
 | Setting | What it does |
 |---|---|
 | `WG_CONFIG` | Path to your WireGuard config. Required for `session start`. |
@@ -131,6 +133,8 @@ If the tunnel does not connect within 15 seconds, the tool tries the fallback co
 | `STRICT` | `1` (default) turns strict mode on. `0` makes it warn only. See [Strict mode](#strict-mode). |
 | `STRICT_ON` | Comma-separated findings that trigger strict mode. Empty means the default set. |
 | `NETWORK_INTERFACE` | Interface to use. Defaults to `en0` on macOS and `wlan0` on Linux. |
+| `ROTATE_INTERVAL` | Default for `watch --interval`, in seconds. |
+| `POLL_SECONDS` | Default for `watch --poll`, in seconds. `session start` has its own `--poll`. |
 
 ## Using a session
 
@@ -140,7 +144,7 @@ Start a session for two hours:
 sudo python main.py session start --duration 2h
 ```
 
-`--duration` is required. Use `90s`, `15m` or `2h`. The session ends when the time is up, on Ctrl-C, or on `session stop`.
+`--duration` is required. Use `90s`, `15m` or `2h`. The session ends on Ctrl-C or `session stop`. When the time is up, it blocks all traffic and waits for `session stop`. See [How a session ends](#how-a-session-ends).
 
 Options:
 
@@ -153,17 +157,33 @@ Options:
 | `--keep-firewall` | Do not change the inbound firewall settings. On Linux this has no effect, because the kill switch already blocks inbound connections. |
 | `--poll N` | Seconds between network and tunnel checks. Default 3. |
 
-With `--portal`, web traffic (TCP 80 and 443) and DNS on the current network are **not protected** while the window is open. Log in to the portal page and nothing else. The protected rules come back when the window closes. If the tunnel is not up at that point, the session stops.
+With `--portal`, web traffic (TCP 80 and 443) and DNS on the current network are **not protected** while the window is open. Log in to the portal page and nothing else. When the window closes, the strict rules come back, and then the tunnel is brought up. If the tunnel cannot come up, the session is rolled back.
 
 ### What happens when you start
 
-1. The tool checks everything first and changes nothing: it runs as root, `wg-quick` and `wg` are installed, both configs are valid, no other VPN holds the default route, and no changes from an earlier session are left over.
-2. The kill switch goes up first. Only DHCP and the VPN server's address can leave the machine.
-3. Inbound connections are blocked, and the host name is randomized (unless you opted out).
-4. The MAC address changes. This drops the Wi-Fi connection, so the network only ever sees the new address. The tool waits for the rejoin. The portal window opens here, if you asked for it.
-5. The tunnel comes up, and the kill switch is reloaded to allow traffic through the tunnel only. The tool runs a leak audit. If the audit fails, every change is undone.
-6. The session holds for the duration, checking the network and the tunnel every few seconds.
-7. When the session ends, every change is undone, newest first. The kill switch comes down last.
+1. **Preflight.** This changes nothing on the system, except that it copies each WireGuard config into a root-only directory in the state directory. It checks that `wg-quick` and `wg` are installed, both configs are valid, no other VPN holds the default route, and no changes from an earlier session are left. From then on the tool uses only those copies. Your original config files are read once and not again, so editing them during a session has no effect.
+   If the interface already has a network when the session starts, the tool prints a notice: that network has already seen this device's real hardware address, and the session cannot take that back. For best protection, start the session before you join a network.
+2. **Kill switch in full lockdown.** Only loopback passes, on every interface. Nothing leaves the machine while its identity changes.
+3. **Inbound connections are blocked**, and the host name is randomized (unless you opted out).
+4. **The MAC address changes.** This drops the Wi-Fi connection, so the network only ever sees the new address.
+5. **Strict rules.** The kill switch allows only DHCP and the tunnel server's address, so the interface can rejoin the network under its new identity.
+6. **Wait to rejoin** the network, for up to 45 seconds.
+7. **Portal window**, if you asked for it. Strict rules come back when it closes.
+8. **Tunnel up.** On macOS, the DNS settings are recorded first, because `wg-quick` rewrites them. The tunnel is brought up, with the fallback config if the first one does not connect.
+9. **Rules updated for the tunnel.** The kill switch is reloaded to allow the tunnel interface. Nothing else gets out.
+10. **Baseline.** The tool records the gateway and its hardware address, and later readings are compared against them. The session does not start without them.
+11. **Leak audit.** If the audit fails, every change is undone.
+
+The session then holds for the duration, checking the network, the tunnel and the kill switch every few seconds.
+
+### How a session ends
+
+| How it ends | What happens | What you do |
+|---|---|---|
+| Time runs out | All traffic is blocked. The tunnel is stopped, and only DHCP passes. The tool prints a notice telling you to leave the network and run `session stop`. **Nothing is restored** until you do. | Leave the network or turn Wi-Fi off, then run `sudo python main.py session stop`. |
+| Terminal closed, or an unexpected error while holding | Same blocking state as above. The session process exits and the journal of changes is kept. | Leave the network, then run `session stop`. With no session process running, it undoes the recorded changes directly. `panic` also works. |
+| `session stop` or Ctrl-C | Prints the stop notice, then restores everything, newest change first. | Leave the network first if you do not want it to see your real address again. |
+| Setup fails (a check, the rejoin, or the leak audit) | Prints the stop notice, undoes every change made so far, then reports the error. | Fix the cause and start the session again. |
 
 ### Other session commands
 
@@ -174,7 +194,7 @@ sudo python main.py audit
 ```
 
 - `session status` shows the time left, the tunnel state, the kill switch state and any findings so far.
-- `session stop` asks the running session to undo everything, and waits for it to finish.
+- `session stop` asks the running session to undo everything, and waits for it to finish. If no session process is running, for example after its terminal was closed, it undoes the recorded changes directly.
 - `audit` runs read-only leak checks and prints a pass or fail table. It exits with status 1 if any check fails. It checks the MAC address, host name, inbound firewall, kill switch, tunnel handshake, default route, DNS and IPv6.
 
 ### Strict mode
@@ -188,9 +208,9 @@ Strict mode is on by default. Detection looks for these findings:
 | `network_reconfigured` | The gateway or DNS servers changed during the session. | Strict |
 | `possible_evil_twin` | The access point changed while the network name stayed the same. Linux only. | Warn only |
 
-A warning appears on the first sighting. A finding in the strict set must appear on two checks in a row before strict mode acts. This stops one garbled reading from triggering it.
+A warning appears on the first sighting. A finding in the strict set triggers going silent when it is seen in 2 of the last 3 checks, including the latest one. One garbled reading is therefore never enough.
 
-When strict mode acts, the tool stops the tunnel and tightens the kill switch. All traffic is blocked. The session stays in that state until you run `session stop`. This is deliberate: the tool does not reopen a hostile network on a timer. `session status` shows the session as held in silent mode.
+Going silent stops the tunnel and tightens the kill switch to block everything except DHCP. The session stays in that state until you run `session stop`. This is deliberate: the tool does not reopen a hostile network on a timer. `session status` shows the session as held in silent mode.
 
 To change strict mode:
 
@@ -202,11 +222,15 @@ The command line overrides `.env`, and `.env` overrides the default.
 
 ## Before you stop
 
-Stopping a session restores your real hardware address and host name. The tool prints this notice when it does:
+Stopping a session restores your real hardware address and host name. The tool prints this notice before it does:
 
 > Restoring your real hardware address and hostname. If you are still connected to the public network, it will see them: leave the network or turn Wi-Fi off first if that matters.
 
 If you are still connected, the network sees your real identity again as soon as the restore runs. Leave the network or turn Wi-Fi off first if that matters.
+
+When the time is up, nothing is restored. The tool prints this instead, and waits for `session stop`:
+
+> Session time is up. All traffic is blocked. Leave the network (or turn Wi-Fi off), then run `sudo python main.py session stop`.
 
 ## If something goes wrong
 
@@ -215,6 +239,8 @@ sudo python main.py panic
 ```
 
 `panic` stops any running session, then undoes every recorded change. It works after a crash, a killed process or a reboot. If it reports a failure, run it again.
+
+If the journal file itself is damaged, `panic` cannot trust its contents. It still removes the tool's kill switch rules, by name, and reports that. It changes nothing else and exits with an error. Check the MAC address, host name, inbound firewall settings, DNS settings and tunnel by hand. The journal's path is printed. A reboot restores the hardware MAC address.
 
 A new session will not start while changes from an earlier session are still recorded. The error tells you to run `panic` first.
 
@@ -225,7 +251,8 @@ A new session will not start while changes from an earlier session are still rec
 | Hardware (MAC) address of the interface | Set the saved address back | No (core feature) |
 | Host name (`ComputerName`, `LocalHostName`, `HostName`; on Linux, the transient host name) | Set the saved names back | `--keep-hostname` |
 | macOS application firewall: on, block-all, stealth | Set the three saved values back | `--keep-firewall` |
-| The tool's own pf anchor (macOS) or nft table (Linux) | Unload that anchor or delete that table only | No |
+| The tool's own pf anchor (macOS) or nft table (Linux). It blocks every interface except loopback and the tunnel; on Linux it also stops all forwarding, so containers and VMs lose network access during a session. | Unload that anchor or delete that table only | No |
+| DNS servers and search domains of every network service (macOS). `wg-quick` changes them on every service, including disabled ones. | Set each service's saved values back, also by `panic` after a crash | No |
 | WireGuard tunnel interface | `wg-quick down` | No |
 
 Nothing else is changed. Saved Wi-Fi networks, auto-join settings, the keychain, network service order and other system settings are left alone.
@@ -261,10 +288,18 @@ Generated addresses are random, unicast and locally administered. They never mat
 ## Platform notes
 
 - **macOS:** For Wi-Fi, the tool turns the radio off and on, then applies the address before the interface rejoins a network. macOS also offers *Private Wi-Fi Address* per network in System Settings. This tool adds manual control, rotation on a timer or on disconnect, and support for Ethernet adapters.
-- **macOS kill switch:** The kill switch loads its rules into the system packet filter (pf). Your main pf ruleset must contain the stock `anchor "com.apple/*"` line. The tool refuses to start without it, and it does not replace the main ruleset.
+- **macOS kill switch:** The kill switch loads its rules into the system packet filter (pf). Your main pf ruleset must contain the stock `anchor "com.apple/*"` line. The tool refuses to start without it, and it does not replace the main ruleset. The rules block every interface except loopback and the tunnel, so a second interface such as Ethernet or phone tethering passes nothing.
+- **Linux kill switch:** The rules are one nftables table of the tool's own. They block every interface except loopback and the tunnel, and they stop all forwarding. Containers and VMs on this machine lose network access for the length of a session.
 - **Linux:** The tool uses `ip link`. NetworkManager may reset the address on reconnect. To prevent that, use NetworkManager's `wifi.cloned-mac-address=random`, or set the connection's cloned address to `preserve`.
 - **Linux notifications:** Desktop notifications use `notify-send`. Under `sudo`, they may not reach your desktop session. Warnings are always printed in the terminal.
 - Some drivers don't allow the address to change. In that case `rotate` reports an error and leaves the interface untouched.
+
+## Security notes
+
+- The tool runs as root. Run it from a location that only root can change, for example a copy under `/usr/local`. Do not run it from a folder you can write to, or from an external drive with ownership disabled.
+- During the Wi-Fi power cycle, the radio may briefly scan with the real hardware address before the new one is applied. A firewall cannot stop that.
+- Notifications are sent to your desktop session, but always watch the terminal too. The terminal output is the record of what the session did.
+- On macOS, Homebrew's `wg-quick` needs a newer bash than the one that ships with the system. The tool runs it with Homebrew's bash.
 
 ## Development
 
