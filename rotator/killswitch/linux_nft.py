@@ -5,7 +5,7 @@ what this one drops. Only this table is ever created or deleted.
 """
 import subprocess
 
-from ..backends.base import BackendError
+from ..backends.base import BackendError, command_env
 from ._common import check_endpoints, check_iface
 
 FAMILY = "inet"
@@ -14,11 +14,17 @@ LOOPBACK = "lo"
 # After connection tracking (-200), which the input chain relies on, and just
 # ahead of the conventional filter priority (0).
 PRIORITY = -10
+DROP_ALL = "drop"  # no interface, no family: everything not accepted above
 
 
 def build_rules(iface: str, tunnel_if: str | None, endpoints: list[tuple[str, int]],
-                allow_portal: bool, *, silent: bool = False) -> str:
+                allow_portal: bool, *, silent: bool = False, allow_dhcp: bool = True) -> str:
     """The nft script for our table. Pure; output is deterministic.
+
+    Default deny on **every** interface, IPv4 and IPv6: loopback is accepted,
+    the tunnel interface is accepted, the physical ``iface`` gets DHCP, the
+    tunnel endpoints and (``allow_portal``) web and DNS, and each chain ends
+    with a bare ``drop``. Nothing is forwarded.
 
     The leading ``add table`` / ``delete table`` pair makes the script replace
     any earlier copy of the table within a single atomic transaction.
@@ -26,6 +32,8 @@ def build_rules(iface: str, tunnel_if: str | None, endpoints: list[tuple[str, in
     ``silent=True`` is the ruleset for a session that has gone silent:
     ``tunnel_if``, ``endpoints`` and ``allow_portal`` are ignored, so only
     loopback and DHCP pass and a tunnel that is still running has no way out.
+    With ``allow_dhcp=False`` as well this is the *lockdown* ruleset used
+    while the identity changes: only loopback passes.
     """
     check_iface(iface)
     if silent:
@@ -46,8 +54,9 @@ def build_rules(iface: str, tunnel_if: str | None, endpoints: list[tuple[str, in
         inp.append(f'iifname "{tunnel_if}" accept')
         outp.append(f'oifname "{tunnel_if}" accept')
 
-    inp.append(f"{i} {v4} udp sport 67 udp dport 68 ct state established accept")
-    outp.append(f"{o} {v4} udp sport 68 udp dport 67 accept")
+    if allow_dhcp:
+        inp.append(f"{i} {v4} udp sport 67 udp dport 68 ct state established accept")
+        outp.append(f"{o} {v4} udp sport 68 udp dport 67 accept")
     for ip, port in eps:
         inp.append(f"{i} ip saddr {ip} udp sport {port} ct state established accept")
         outp.append(f"{o} ip daddr {ip} udp dport {port} accept")
@@ -55,9 +64,9 @@ def build_rules(iface: str, tunnel_if: str | None, endpoints: list[tuple[str, in
         for proto, port in (("tcp", 80), ("tcp", 443), ("udp", 53), ("tcp", 53)):
             inp.append(f"{i} {v4} {proto} sport {port} ct state established accept")
             outp.append(f"{o} {v4} {proto} dport {port} accept")
-    inp.append(f"{i} drop")
-    outp.append(f"{o} drop")
-    fwd = [f"{i} drop", f"{o} drop"]
+    inp.append(DROP_ALL)
+    outp.append(DROP_ALL)
+    fwd = [DROP_ALL]
 
     lines = [
         f"add table {FAMILY} {TABLE}",
@@ -78,7 +87,10 @@ def build_rules(iface: str, tunnel_if: str | None, endpoints: list[tuple[str, in
 def _nft(*args: str, input: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
     cmd = ["nft", *args]
     try:
-        result = subprocess.run(cmd, input=input, capture_output=True, text=True)
+        # Not ``backends.base.run``: the exit status and stderr are needed here
+        # (pfctl prints its enable token on stderr). Same fixed environment.
+        result = subprocess.run(cmd, input=input, capture_output=True, text=True,
+                                errors="replace", env=command_env("nft"))
     except FileNotFoundError as e:
         raise BackendError("Command not found: nft") from e
     if check and result.returncode != 0:
@@ -87,11 +99,26 @@ def _nft(*args: str, input: str | None = None, check: bool = True) -> subprocess
     return result
 
 
+def _chains_end_with_drop(rules: str) -> bool:
+    """Whether input, output and forward all exist and end with a bare drop."""
+    lines = [line.strip() for line in rules.splitlines()]
+    ended = set()
+    for n, line in enumerate(lines):
+        if line == "}" and n >= 1 and lines[n - 1] == DROP_ALL:
+            for back in range(n - 1, -1, -1):
+                if lines[back].startswith("chain "):
+                    ended.add(lines[back].split()[1])
+                    break
+    return ended == {"input", "output", "forward"}
+
+
 def load(rules: str, undo: dict | None = None) -> dict:
     """Load (or atomically replace) our table. ``undo`` is accepted for
     symmetry with the macOS module and is not needed here."""
-    if f"table {FAMILY} {TABLE} {{" not in rules or " drop" not in rules:
-        raise BackendError("Refusing to load kill switch rules without our table and a drop rule")
+    if f"table {FAMILY} {TABLE} {{" not in rules or not _chains_end_with_drop(rules):
+        raise BackendError(
+            "Refusing to load kill switch rules without our table or whose chains do not "
+            "end by dropping everything")
     _nft("-f", "-", input=rules)
     return {"table": TABLE}
 

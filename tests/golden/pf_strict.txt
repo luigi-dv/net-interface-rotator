@@ -3,5 +3,4 @@ pass quick on utun5 all no state
 pass out quick on en0 inet proto udp from any port 68 to any port 67 keep state
 pass out quick on en0 inet proto udp from any to 192.0.2.10 port 51820 keep state
 pass out quick on en0 inet proto udp from any to 198.51.100.20 port 51821 keep state
-block drop quick on en0 inet6 all
-block drop quick on en0 all
+block drop quick all

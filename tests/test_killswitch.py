@@ -11,12 +11,12 @@ ENDPOINTS = [("192.0.2.10", 51820), ("198.51.100.20", 443)]
 PORTAL_PORT = re.compile(r"port (53|80|443)\b")
 
 
-def pf(tunnel_if="utun5", portal=False, endpoints=ENDPOINTS):
-    return macos_pf.build_rules("en0", tunnel_if, endpoints, portal)
+def pf(tunnel_if="utun5", portal=False, endpoints=ENDPOINTS, **kwargs):
+    return macos_pf.build_rules("en0", tunnel_if, endpoints, portal, **kwargs)
 
 
-def nft(tunnel_if="wg0", portal=False, endpoints=ENDPOINTS):
-    return linux_nft.build_rules("eth0", tunnel_if, endpoints, portal)
+def nft(tunnel_if="wg0", portal=False, endpoints=ENDPOINTS, **kwargs):
+    return linux_nft.build_rules("eth0", tunnel_if, endpoints, portal, **kwargs)
 
 
 def chain(rules, name):
@@ -33,20 +33,53 @@ def test_pf_strict_ruleset_exact():
         "pass out quick on en0 inet proto udp from any port 68 to any port 67 keep state",
         "pass out quick on en0 inet proto udp from any to 192.0.2.10 port 51820 keep state",
         "pass out quick on en0 inet proto udp from any to 198.51.100.20 port 443 keep state",
-        "block drop quick on en0 inet6 all",
-        "block drop quick on en0 all",
+        "block drop quick all",
     ]
     assert pf().endswith("\n")
     assert pf() == pf()
 
 
-def test_pf_every_rule_is_quick_and_block_comes_last():
-    for portal in (False, True):
-        lines = pf(portal=portal).splitlines()
+def test_pf_every_rule_is_quick_and_block_everything_comes_last():
+    for rules in (pf(), pf(portal=True), pf(tunnel_if=None), pf(silent=True),
+                  pf(silent=True, allow_dhcp=False)):
+        lines = rules.splitlines()
         assert all(" quick " in line for line in lines)
-        assert lines[-1] == "block drop quick on en0 all"
-        assert lines[-2] == "block drop quick on en0 inet6 all"
-        assert not any(line.startswith("block") for line in lines[:-2])
+        # No interface and no address family: every interface, IPv4 and IPv6.
+        assert lines[-1] == "block drop quick all"
+        assert not any(line.startswith("block") for line in lines[:-1])
+
+
+def test_pf_passes_name_only_loopback_tunnel_and_iface():
+    for portal in (False, True):
+        for line in pf(portal=portal).splitlines()[:-1]:
+            words = line.split()
+            assert words[0] == "pass"
+            iface = words[words.index("on") + 1]
+            assert iface in ("lo0", "utun5", "en0")
+            if iface == "en0":
+                assert line.startswith("pass out quick on en0 inet proto ")
+
+
+def test_pf_lockdown_passes_only_loopback():
+    assert pf(silent=True, allow_dhcp=False).splitlines() == [
+        "pass quick on lo0 all no state",
+        "block drop quick all",
+    ]
+    # silent ignores the tunnel, the endpoints and the portal flag.
+    assert pf(portal=True, silent=True, allow_dhcp=False) == pf(None, False, [], silent=True, allow_dhcp=False)
+
+
+def test_pf_silent_passes_loopback_and_dhcp():
+    assert pf(silent=True).splitlines() == [
+        "pass quick on lo0 all no state",
+        "pass out quick on en0 inet proto udp from any port 68 to any port 67 keep state",
+        "block drop quick all",
+    ]
+
+
+def test_pf_allow_dhcp_false_only_removes_the_dhcp_rule():
+    dhcp = "pass out quick on en0 inet proto udp from any port 68 to any port 67 keep state"
+    assert [l for l in pf().splitlines() if l != dhcp] == pf(allow_dhcp=False).splitlines()
 
 
 def test_pf_never_passes_inbound_on_iface():
@@ -62,10 +95,9 @@ def test_pf_strict_has_no_portal_ports():
             assert not PORTAL_PORT.search(line)
 
 
-def test_pf_ipv6_blocked_on_iface():
+def test_pf_ipv6_blocked_everywhere_but_loopback_and_tunnel():
     rules = pf(portal=True)
-    assert "block drop quick on en0 inet6 all" in rules
-    assert [l for l in rules.splitlines() if "inet6" in l] == ["block drop quick on en0 inet6 all"]
+    assert "inet6" not in rules  # no IPv6 pass; the final block has no family
     for line in rules.splitlines():
         if line.startswith("pass") and " on en0 " in line:
             assert " inet proto " in line
@@ -110,7 +142,7 @@ def test_nft_strict_ruleset_exact():
         '\t\tiifname "eth0" meta nfproto ipv4 udp sport 67 udp dport 68 ct state established accept\n'
         '\t\tiifname "eth0" ip saddr 192.0.2.10 udp sport 51820 ct state established accept\n'
         '\t\tiifname "eth0" ip saddr 198.51.100.20 udp sport 443 ct state established accept\n'
-        '\t\tiifname "eth0" drop\n'
+        "\t\tdrop\n"
         "\t}\n"
         "\n"
         "\tchain output {\n"
@@ -120,13 +152,12 @@ def test_nft_strict_ruleset_exact():
         '\t\toifname "eth0" meta nfproto ipv4 udp sport 68 udp dport 67 accept\n'
         '\t\toifname "eth0" ip daddr 192.0.2.10 udp dport 51820 accept\n'
         '\t\toifname "eth0" ip daddr 198.51.100.20 udp dport 443 accept\n'
-        '\t\toifname "eth0" drop\n'
+        "\t\tdrop\n"
         "\t}\n"
         "\n"
         "\tchain forward {\n"
         "\t\ttype filter hook forward priority -10; policy accept;\n"
-        '\t\tiifname "eth0" drop\n'
-        '\t\toifname "eth0" drop\n'
+        "\t\tdrop\n"
         "\t}\n"
         "}\n"
     )
@@ -141,14 +172,45 @@ def test_nft_reload_is_atomic_replace():
     ]
 
 
-def test_nft_chains_end_with_drop_on_iface():
-    for portal in (False, True):
-        rules = nft(portal=portal)
-        assert chain(rules, "input")[-1] == 'iifname "eth0" drop'
-        assert chain(rules, "output")[-1] == 'oifname "eth0" drop'
-        assert chain(rules, "forward")[1:] == ['iifname "eth0" drop', 'oifname "eth0" drop']
+def test_nft_chains_end_by_dropping_everything():
+    for rules in (nft(), nft(portal=True), nft(tunnel_if=None), nft(silent=True),
+                  nft(silent=True, allow_dhcp=False)):
+        # A bare drop: no interface and no family, so every interface, v4 and v6.
+        assert chain(rules, "input")[-1] == "drop"
+        assert chain(rules, "output")[-1] == "drop"
+        assert chain(rules, "forward")[1:] == ["drop"]
         for name in ("input", "output", "forward"):
             assert re.search(rf"hook {name} priority -?\d+; policy accept;", chain(rules, name)[0])
+            assert not any("drop" in line for line in chain(rules, name)[1:-1])
+
+
+def test_nft_accepts_name_only_loopback_tunnel_and_iface():
+    for portal in (False, True):
+        rules = nft(portal=portal)
+        for name in ("input", "output"):
+            for line in chain(rules, name)[1:-1]:
+                assert line.endswith("accept")
+                assert line.split()[1] in ('"lo"', '"wg0"', '"eth0"')
+
+
+def test_nft_lockdown_accepts_only_loopback():
+    rules = nft(silent=True, allow_dhcp=False)
+    assert chain(rules, "input")[1:] == ['iifname "lo" accept', "drop"]
+    assert chain(rules, "output")[1:] == ['oifname "lo" accept', "drop"]
+    assert chain(rules, "forward")[1:] == ["drop"]
+    assert "eth0" not in rules and "wg0" not in rules
+
+
+def test_nft_silent_accepts_loopback_and_dhcp():
+    rules = nft(silent=True)
+    assert chain(rules, "input")[1:] == [
+        'iifname "lo" accept',
+        'iifname "eth0" meta nfproto ipv4 udp sport 67 udp dport 68 ct state established accept',
+        "drop"]
+    assert chain(rules, "output")[1:] == [
+        'oifname "lo" accept',
+        'oifname "eth0" meta nfproto ipv4 udp sport 68 udp dport 67 accept',
+        "drop"]
 
 
 def test_nft_inbound_on_iface_is_replies_only():
@@ -164,7 +226,7 @@ def test_nft_strict_has_no_portal_ports():
         assert not re.search(r"(sport|dport) (53|80|443)\b", line)
 
 
-def test_nft_ipv6_blocked_on_iface():
+def test_nft_ipv6_is_never_accepted_on_iface():
     rules = nft(portal=True)
     assert "ip6" not in rules and "ipv6" not in rules
     for line in rules.splitlines():
@@ -246,6 +308,8 @@ class FakeCommands:
 
     def __call__(self, cmd, input=None, capture_output=False, text=False, **kwargs):
         assert isinstance(cmd, list) and not kwargs.get("shell")
+        # The fixed environment every root command gets, not the caller's.
+        assert kwargs["env"]["LC_ALL"] == "C" and kwargs["env"]["PATH"].startswith("/usr/sbin")
         self.calls.append(cmd[1:])
         self.inputs.append(input)
         rc, out, err = self.answers.get(tuple(cmd[1:]), (0, "", ""))
@@ -269,7 +333,7 @@ def test_pf_load_first_time(monkeypatch):
     rules = pf(tunnel_if=None)
     undo = macos_pf.load(rules)
     assert undo == {"anchor": "com.apple/000.net-interface-rotator", "token": "1234567890123456789"}
-    assert fake.calls == [["-sr"], ["-a", A, "-f", "-"], ["-E"], ["-i", "en0", "-F", "states"]]
+    assert fake.calls == [["-sr"], ["-a", A, "-f", "-"], ["-E"], ["-F", "states"]]
     assert fake.inputs[1] == rules
 
 
@@ -278,7 +342,35 @@ def test_pf_reload_takes_no_second_reference(monkeypatch):
     undo = macos_pf.load(pf(tunnel_if=None))
     fake.calls.clear()
     assert macos_pf.load(pf(), undo) == undo
-    assert fake.calls == [["-sr"], ["-a", A, "-f", "-"]]
+    # No second -E, and the states of the looser ruleset are flushed again.
+    assert fake.calls == [["-sr"], ["-a", A, "-f", "-"], ["-F", "states"]]
+
+
+def test_pf_every_load_flushes_states_including_the_portal_window(monkeypatch):
+    fake = pf_fake(monkeypatch)
+    lockdown = pf(tunnel_if=None, silent=True, allow_dhcp=False)
+    strict, portal = pf(tunnel_if=None), pf(tunnel_if=None, portal=True)
+    undo = macos_pf.load(lockdown)
+    for rules in (strict, portal, strict, pf(), pf(silent=True)):
+        macos_pf.load(rules, undo)
+    loads = [n for n, call in enumerate(fake.calls) if call == ["-a", A, "-f", "-"]]
+    assert [fake.inputs[n] for n in loads] == [lockdown, strict, portal, strict, pf(), pf(silent=True)]
+    # Each load is followed by a state flush before the next load starts, so a
+    # connection opened in the portal window cannot outlive the strict reload.
+    for n, nxt in zip(loads, loads[1:] + [len(fake.calls)]):
+        assert ["-F", "states"] in fake.calls[n + 1:nxt]
+    assert fake.calls.count(["-F", "states"]) == 6
+    assert fake.calls.count(["-E"]) == 1
+
+
+def test_pf_reload_reports_a_failed_state_flush(monkeypatch):
+    fake = pf_fake(monkeypatch)
+    undo = macos_pf.load(pf(tunnel_if=None))
+    fake.answers[("-F", "states")] = (1, "", "boom")
+    with pytest.raises(BackendError, match="boom"):
+        macos_pf.load(pf(), undo)
+    # The stricter rules stay loaded; nothing of ours is flushed or released.
+    assert ["-a", A, "-F", "all"] not in fake.calls and not any("-X" in c for c in fake.calls)
 
 
 def test_pf_load_refuses_when_parent_anchor_missing(monkeypatch):
@@ -288,10 +380,14 @@ def test_pf_load_refuses_when_parent_anchor_missing(monkeypatch):
     assert fake.calls == [["-sr"]]
 
 
-def test_pf_load_refuses_rules_without_block(monkeypatch):
+def test_pf_load_refuses_rules_that_do_not_end_by_blocking_everything(monkeypatch):
     fake = pf_fake(monkeypatch)
-    with pytest.raises(BackendError):
-        macos_pf.load("pass quick on lo0 all no state\n")
+    for bad in ("pass quick on lo0 all no state\n",
+                "block drop quick on en0 all\n",  # one interface only
+                "block drop quick all\npass quick on en1 all\n",  # not the last rule
+                ""):
+        with pytest.raises(BackendError):
+            macos_pf.load(bad)
     assert fake.calls == []
 
 
@@ -303,7 +399,7 @@ def test_pf_load_cleans_up_when_enable_gives_no_token(monkeypatch):
 
 
 def test_pf_load_cleans_up_when_state_flush_fails(monkeypatch):
-    fake = pf_fake(monkeypatch, {("-i", "en0", "-F", "states"): (1, "", "boom")})
+    fake = pf_fake(monkeypatch, {("-F", "states"): (1, "", "boom")})
     with pytest.raises(BackendError):
         macos_pf.load(pf())
     assert fake.calls[-2:] == [["-a", A, "-F", "all"], ["-X", "1234567890123456789"]]
@@ -348,12 +444,52 @@ def test_pf_never_runs_forbidden_commands(monkeypatch):
 
 
 def test_pf_is_loaded(monkeypatch):
-    pf_fake(monkeypatch, {("-a", A, "-sr"): (0, pf(), ""), ("-si",): (0, "Status: Enabled for 0 days\n", "")})
+    enabled = (0, "Status: Enabled for 0 days\n", "")
+    listed = (0, pf(), "")
+    good = {("-a", A, "-sr"): listed, ("-si",): enabled}
+    pf_fake(monkeypatch, good)
     assert macos_pf.is_loaded() is True
-    pf_fake(monkeypatch, {("-a", A, "-sr"): (0, "", ""), ("-si",): (0, "Status: Enabled\n", "")})
+    pf_fake(monkeypatch, {**good, ("-a", A, "-sr"): (0, pf(silent=True, allow_dhcp=False), "")})
+    assert macos_pf.is_loaded() is True
+    # Empty anchor, pf disabled.
+    pf_fake(monkeypatch, {**good, ("-a", A, "-sr"): (0, "", "")})
     assert macos_pf.is_loaded() is False
-    pf_fake(monkeypatch, {("-a", A, "-sr"): (0, pf(), ""), ("-si",): (0, "Status: Disabled\n", "")})
+    pf_fake(monkeypatch, {**good, ("-si",): (0, "Status: Disabled\n", "")})
     assert macos_pf.is_loaded() is False
+
+
+def test_pf_is_loaded_needs_the_parent_anchor_and_our_final_block(monkeypatch):
+    enabled = (0, "Status: Enabled for 0 days\n", "")
+    good = {("-a", A, "-sr"): (0, pf(), ""), ("-si",): enabled}
+    # The main ruleset was replaced and no longer evaluates com.apple/*.
+    pf_fake(monkeypatch, {**good, ("-sr",): (0, 'anchor "other/*" all\n', "")})
+    assert macos_pf.is_loaded() is False
+    pf_fake(monkeypatch, {**good, ("-sr",): (1, "", "pfctl: /dev/pf: Permission denied")})
+    assert macos_pf.is_loaded() is False
+    # Our anchor holds rules, but not (or no longer last) the block of everything.
+    without_block = "".join(l + "\n" for l in pf().splitlines()[:-1])
+    pf_fake(monkeypatch, {**good, ("-a", A, "-sr"): (0, without_block, "")})
+    assert macos_pf.is_loaded() is False
+    pf_fake(monkeypatch, {**good, ("-a", A, "-sr"): (0, pf() + "pass quick on en1 all\n", "")})
+    assert macos_pf.is_loaded() is False
+    pf_fake(monkeypatch, {**good, ("-a", A, "-sr"): (0, "block drop quick on en0 all\n", "")})
+    assert macos_pf.is_loaded() is False
+
+
+def test_pf_ensure_enabled(monkeypatch):
+    fake = pf_fake(monkeypatch, {("-si",): (0, "Status: Enabled for 0 days\n", "")})
+    assert macos_pf.ensure_enabled() is None
+    assert fake.calls == [["-si"]]  # still enabled: no second reference
+    fake = pf_fake(monkeypatch, {("-si",): (0, "Status: Disabled\n", "")})
+    assert macos_pf.ensure_enabled() == "1234567890123456789"
+    assert fake.calls == [["-si"], ["-E"]]
+
+
+def test_pf_drop_states_all_or_one_interface(monkeypatch):
+    fake = pf_fake(monkeypatch)
+    macos_pf.drop_states()
+    macos_pf.drop_states("en0")
+    assert fake.calls == [["-F", "states"], ["-i", "en0", "-F", "states"]]
 
 
 def test_nft_load_and_reload(monkeypatch):
@@ -371,6 +507,17 @@ def test_nft_load_failure_raises(monkeypatch):
         linux_nft.load(nft())
     with pytest.raises(BackendError):
         linux_nft.load("flush ruleset\n")
+
+
+def test_nft_load_refuses_rules_whose_chains_do_not_drop_everything(monkeypatch):
+    fake = FakeCommands(monkeypatch, linux_nft)
+    good = nft()
+    for bad in (good.replace("\t\tdrop\n", '\t\toifname "eth0" drop\n'),  # one interface only
+                good.replace("\t\tdrop\n\t}\n}", "\t}\n}"),  # forward chain forwards
+                good.replace("\t\tdrop\n", "\t\tdrop\n\t\taccept\n", 1)):
+        with pytest.raises(BackendError):
+            linux_nft.load(bad)
+    assert fake.calls == []
 
 
 def test_nft_unload_deletes_only_our_table(monkeypatch):

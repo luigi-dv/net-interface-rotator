@@ -79,10 +79,26 @@ def test_gateway_ip_change_is_reconfigured_not_spoof():
 
 @pytest.mark.parametrize(
     "dns",
-    [("192.0.2.99",), DNS + ("192.0.2.99",), DNS[:1], ()],
+    [("192.0.2.99",), DNS + ("192.0.2.99",), DNS[:1]],
 )
 def test_dns_change_is_reconfigured(dns):
     assert check(replace(BASE, dns=dns)) == {NETWORK_RECONFIGURED}
+
+
+def test_empty_dns_read_is_unknown_not_a_change():
+    # Either side empty: the DHCP read returned nothing, which proves nothing.
+    assert check(replace(BASE, dns=())) == set()
+    assert check(BASE, baseline=replace(BASE, dns=())) == set()
+    assert check(replace(BASE, dns=()), baseline=replace(BASE, dns=())) == set()
+    # A gateway change is still reported whatever the DNS read says.
+    assert check(replace(BASE, gateway="192.0.2.254", dns=())) == {NETWORK_RECONFIGURED}
+
+
+def test_usable_as_baseline_needs_gateway_and_a_gateway_mac():
+    assert detect.usable_as_baseline(BASE) is True
+    assert detect.usable_as_baseline(replace(BASE, dns=())) is True
+    assert detect.usable_as_baseline(replace(BASE, gateway_macs=frozenset())) is False
+    assert detect.usable_as_baseline(DISCONNECTED) is False
 
 
 def test_dns_reorder_alone_is_not_a_finding():
@@ -221,20 +237,35 @@ def test_go_silent_and_warn_are_emitted_once_while_finding_persists():
     assert out[2:] == [[], [], []]
 
 
-def test_non_consecutive_sightings_never_go_silent():
+def test_alternating_finding_goes_silent_on_two_of_three():
+    # ARP poisoning that alternates with the real answer: seen, clear, seen.
     out = run_checks([{ARP_CONFLICT}, set(), {ARP_CONFLICT}, set(), {ARP_CONFLICT}])
     assert out == [
         [("warn", ARP_CONFLICT)],
         [],
-        [("warn", ARP_CONFLICT)],
+        [("warn", ARP_CONFLICT), ("go_silent", ARP_CONFLICT)],
         [],
-        [("warn", ARP_CONFLICT)],
+        [("warn", ARP_CONFLICT), ("go_silent", ARP_CONFLICT)],
     ]
 
 
-def test_only_the_immediately_previous_check_counts():
+def test_sightings_more_than_two_checks_apart_never_go_silent():
+    out = run_checks([{ARP_CONFLICT}, set(), set(), {ARP_CONFLICT}, set(), set(), {ARP_CONFLICT}])
+    assert out == [[("warn", ARP_CONFLICT)], [], []] * 2 + [[("warn", ARP_CONFLICT)]]
+
+
+def test_only_the_last_three_checks_count():
+    # Two old sightings and a gap: the newest check plus the one two back.
     history = [{ARP_CONFLICT}, {ARP_CONFLICT}, set()]
+    assert react({ARP_CONFLICT}, history, True, DEFAULT_STRICT_ON) == [
+        ("warn", ARP_CONFLICT), ("go_silent", ARP_CONFLICT)]
+    # Sightings older than that do not count.
+    history = [{ARP_CONFLICT}, {ARP_CONFLICT}, set(), set()]
     assert react({ARP_CONFLICT}, history, True, DEFAULT_STRICT_ON) == [("warn", ARP_CONFLICT)]
+
+
+def test_one_garbled_reading_is_never_enough():
+    assert run_checks([set(), {ARP_CONFLICT}, set(), set()]) == [[], [("warn", ARP_CONFLICT)], [], []]
 
 
 def test_different_findings_on_consecutive_checks_do_not_combine():
@@ -248,8 +279,8 @@ def test_finding_that_clears_and_returns_reacts_again():
         [("warn", ARP_CONFLICT)],
         [("go_silent", ARP_CONFLICT)],
         [],
-        [("warn", ARP_CONFLICT)],
-        [("go_silent", ARP_CONFLICT)],
+        [("warn", ARP_CONFLICT), ("go_silent", ARP_CONFLICT)],  # 2 of the last 3 again
+        [],
     ]
 
 

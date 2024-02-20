@@ -18,7 +18,7 @@ def check_iface(name: str) -> str:
 def check_endpoints(endpoints) -> list[tuple[ipaddress.IPv4Address, int]]:
     """Validate and de-duplicate ``(ip, port)`` pairs, keeping their order.
 
-    IPv4 only: IPv6 is fully blocked on the physical interface, so an IPv6
+    IPv4 only: IPv6 is blocked on every interface but the tunnel, so an IPv6
     endpoint could never be reached."""
     seen = []
     for host, port in endpoints:

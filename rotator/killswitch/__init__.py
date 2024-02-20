@@ -1,10 +1,13 @@
-"""Firewall kill switch: nothing leaves the physical interface outside the tunnel.
+"""Firewall kill switch: nothing leaves the machine outside the tunnel, on
+any interface.
 
-Each platform module exposes the same three functions:
+Each platform module exposes the same functions:
 
-    build_rules(iface, tunnel_if, endpoints, allow_portal) -> str   (pure)
+    build_rules(iface, tunnel_if, endpoints, allow_portal,
+                *, silent=False, allow_dhcp=True) -> str            (pure)
     load(rules, undo=None) -> dict      undo info for the caller to journal
     unload(undo) -> list[str]           non-fatal warnings
+    is_loaded() -> bool
 
 Pass the dict from the first ``load`` as ``undo`` when reloading.
 """

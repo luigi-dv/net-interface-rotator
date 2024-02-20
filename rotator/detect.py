@@ -77,8 +77,11 @@ def findings(baseline: Reading, previous: Reading, current: Reading) -> set[str]
     ):
         found.add(ARP_SPOOF_SUSPECTED)
 
-    # Order is ignored: a reshuffled resolver list alone must not trip strict mode.
-    if current.gateway != baseline.gateway or set(current.dns) != set(baseline.dns):
+    # Order is ignored: a reshuffled resolver list alone must not trip strict
+    # mode. An empty list means the read came back with nothing ("unknown"),
+    # not that the network withdrew its resolvers, so both sides must be known.
+    dns_changed = bool(current.dns) and bool(baseline.dns) and set(current.dns) != set(baseline.dns)
+    if current.gateway != baseline.gateway or dns_changed:
         found.add(NETWORK_RECONFIGURED)
 
     if (
@@ -103,6 +106,20 @@ def _check_names(names) -> None:
             )
 
 
+def usable_as_baseline(reading: Reading) -> bool:
+    """Whether ``reading`` says enough to judge later ones against: a gateway
+    and at least one hardware address answering for it. Without them ARP
+    spoofing could never be noticed."""
+    return reading.gateway is not None and bool(reading.gateway_macs)
+
+
+def _confirmed(finding: str, window: list[set[str]]) -> bool:
+    """``window`` is up to three consecutive checks, newest last. Confirmed
+    means seen on the newest check and on at least one of the two before."""
+    recent = window[-3:]
+    return bool(recent) and finding in recent[-1] and sum(finding in c for c in recent) >= 2
+
+
 def react(
     current_findings: set[str],
     history: list[set[str]],
@@ -112,7 +129,7 @@ def react(
     """Decide what to do about this check's findings.
 
     ``history`` holds the findings of the earlier checks, oldest first, and
-    does not include ``current_findings``.
+    does not include ``current_findings``. Pass at least the last three.
 
     Returns ``(action, finding)`` pairs, warnings first, each group sorted by
     finding name:
@@ -120,19 +137,25 @@ def react(
     - ``("warn", f)`` the first time ``f`` appears, and not again while it
       persists on consecutive checks. It warns again if it clears and returns.
     - ``("go_silent", f)`` when strict mode is on, ``f`` is in ``strict_on``,
-      and ``f`` was seen on this check and the one immediately before. One
-      garbled reading is therefore never enough. Emitted once per unbroken run
-      of ``f``: on the second consecutive check, not the third or later.
+      and ``f`` was seen on this check and on at least one of the two checks
+      before it: present in 2 of the last 3. One garbled reading is therefore
+      never enough, but a finding that comes and goes on alternate checks
+      (ARP poisoning that alternates with the real answer) still counts.
+      Not emitted again on the very next check if it was emitted on the
+      previous one; callers must treat it as idempotent all the same.
     """
     _check_names(strict_on)
 
     last = history[-1] if history else set()
-    before_last = history[-2] if len(history) >= 2 else set()
 
     actions = [(WARN, f) for f in sorted(current_findings - last)]
     if strict:
-        confirmed = (current_findings & last & strict_on) - before_last
-        actions += [(GO_SILENT, f) for f in sorted(confirmed)]
+        window = list(history[-2:]) + [current_findings]
+        earlier = list(history[-3:])
+        actions += [
+            (GO_SILENT, f) for f in sorted(current_findings & strict_on)
+            if _confirmed(f, window) and not _confirmed(f, earlier)
+        ]
     return actions
 
 

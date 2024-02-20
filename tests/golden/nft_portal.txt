@@ -10,7 +10,7 @@ table inet net_interface_rotator {
 		iifname "wlan0" meta nfproto ipv4 tcp sport 443 ct state established accept
 		iifname "wlan0" meta nfproto ipv4 udp sport 53 ct state established accept
 		iifname "wlan0" meta nfproto ipv4 tcp sport 53 ct state established accept
-		iifname "wlan0" drop
+		drop
 	}
 
 	chain output {
@@ -22,12 +22,11 @@ table inet net_interface_rotator {
 		oifname "wlan0" meta nfproto ipv4 tcp dport 443 accept
 		oifname "wlan0" meta nfproto ipv4 udp dport 53 accept
 		oifname "wlan0" meta nfproto ipv4 tcp dport 53 accept
-		oifname "wlan0" drop
+		drop
 	}
 
 	chain forward {
 		type filter hook forward priority -10; policy accept;
-		iifname "wlan0" drop
-		oifname "wlan0" drop
+		drop
 	}
 }

@@ -1,0 +1,20 @@
+add table inet net_interface_rotator
+delete table inet net_interface_rotator
+table inet net_interface_rotator {
+	chain input {
+		type filter hook input priority -10; policy accept;
+		iifname "lo" accept
+		drop
+	}
+
+	chain output {
+		type filter hook output priority -10; policy accept;
+		oifname "lo" accept
+		drop
+	}
+
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+		drop
+	}
+}
